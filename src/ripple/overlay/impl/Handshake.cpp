@@ -316,38 +316,35 @@ verifyHandshake(
         }
     }
 
-    PublicKey const publicValidate = [&headers] {
-        if (auto const iter = headers.find("Validate-PublicKey");
-            iter != headers.end())
-        {
-            auto pk = parseBase58<PublicKey>(
-                TokenType::NodePublic, iter->value().to_string());
-
-            if (pk)
-            {
-                if (publicKeyType(*pk) != CommonKey::chainAlgTypeG)
-                    throw std::runtime_error("Unsupported public key type");
-
-                return *pk;
-            }
-        }
-
-        throw std::runtime_error("Bad node public key");
-    }();
-
-    if (publicValidate == app.getValidationPublicKey())
-        throw std::runtime_error("Self connection(same validate publicKey)");
-
+    // Tracking nodes omit Validate-PublicKey (see buildHandshake).
+    // Validators still send it; verify only when present.
+    boost::optional<PublicKey> publicValidate;
+    if (auto const iter = headers.find("Validate-PublicKey");
+        iter != headers.end())
     {
-        auto const iter = headers.find("Validate-Proof");
+        auto pk = parseBase58<PublicKey>(
+            TokenType::NodePublic, iter->value().to_string());
 
-        if (iter == headers.end())
+        if (!pk)
+            throw std::runtime_error("Bad consensus public key");
+
+        if (publicKeyType(*pk) != CommonKey::chainAlgTypeG)
+            throw std::runtime_error("Unsupported public key type");
+
+        if (app.getValidationPublicKey().size() != 0 &&
+            *pk == app.getValidationPublicKey())
+            throw std::runtime_error(
+                "Self connection(same validate publicKey)");
+
+        auto const proofIter = headers.find("Validate-Proof");
+        if (proofIter == headers.end())
             throw std::runtime_error("No session Validate-Proof specified");
 
-        auto sig = base64_decode(iter->value().to_string());
-
-        if (!verifyDigest(publicValidate, sharedValue, makeSlice(sig), false))
+        auto sig = base64_decode(proofIter->value().to_string());
+        if (!verifyDigest(*pk, sharedValue, makeSlice(sig), false))
             throw std::runtime_error("Failed to verify session");
+
+        publicValidate = *pk;
     }
 
     {

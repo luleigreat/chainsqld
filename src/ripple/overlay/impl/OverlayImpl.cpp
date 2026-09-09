@@ -274,7 +274,7 @@ OverlayImpl::onHandoff(
             remote_endpoint.address(),
             app_);
 
-        if(!retPair.first || !retPair.second)
+        if(!retPair.first)
         {
             m_peerFinder->on_closed(slot);
             handoff.moved = false;
@@ -293,7 +293,8 @@ OverlayImpl::onHandoff(
             // check publicValidate duplicate
             for (auto const& peer : getActivePeers())
             {
-                if (peer->getValPublic() == publicValidate)
+                if (publicValidate && peer->getValPublic() &&
+                    *peer->getValPublic() == *publicValidate)
                 {
                     m_peerFinder->on_closed(slot);
                     JLOG(journal.debug()) << "Peer " << remote_endpoint

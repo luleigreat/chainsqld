@@ -376,7 +376,7 @@ ConnectAttempt::processResponse()
             remote_endpoint_.address(),
             app_);
 
-        if (!retPair.first || !retPair.second)
+        if (!retPair.first)
             return close();  // verifyHello logs
 
         auto publicKey = *retPair.first;
@@ -395,7 +395,8 @@ ConnectAttempt::processResponse()
 
         for (auto const& peer : overlay_.getActivePeers())
         {
-            if (peer->getValPublic() == publicValidate)
+            if (publicValidate && peer->getValPublic() &&
+                *peer->getValPublic() == *publicValidate)
             {
                 return fail("Outbound slots full");
             }
