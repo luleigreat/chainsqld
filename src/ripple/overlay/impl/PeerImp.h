@@ -39,6 +39,7 @@
 #include <boost/circular_buffer.hpp>
 #include <boost/endian/conversion.hpp>
 #include <boost/optional.hpp>
+#include <atomic>
 #include <cstdint>
 #include <queue>
 #include <shared_mutex>
@@ -150,6 +151,7 @@ private:
 
     State state_;  // Current state
     bool detaching_ = false;
+    std::atomic<bool> slotReleased_{false};
     // Node public key of peer.
     PublicKey const publicKey_;
     boost::optional<PublicKey> publicValidate_;
@@ -387,6 +389,17 @@ public:
     {
         return publicValidate_;
     }
+
+    /** True if the TCP socket is still open and the overlay slot is held. */
+    bool
+    isAlive() const
+    {
+        return socket_.is_open() && !detaching_ && !slotReleased_.load();
+    }
+
+    /** Drop this peer from PeerFinder/overlay immediately so a reconnect can succeed. */
+    void
+    releaseSlot();
 
     /** Return the version of rippled that the peer is running, if reported. */
     std::string

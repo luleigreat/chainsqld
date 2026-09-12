@@ -290,22 +290,17 @@ OverlayImpl::onHandoff(
         auto publicKey = *retPair.first;
         auto publicValidate = retPair.second;
         {
-            // check publicValidate duplicate
-            for (auto const& peer : getActivePeers())
+            if (!evictStaleDuplicate(publicKey, publicValidate))
             {
-                if (publicValidate && peer->getValPublic() &&
-                    *peer->getValPublic() == *publicValidate)
-                {
-                    m_peerFinder->on_closed(slot);
-                    JLOG(journal.debug()) << "Peer " << remote_endpoint
-                                          << " redirected, slots full,result="
-                                          << (int)PeerFinder::Result::duplicate;
-                    handoff.moved = false;
-                    handoff.response = makeRedirectResponse(
-                        slot, request, remote_endpoint.address());
-                    handoff.keep_alive = false;
-                    return handoff;
-                }
+                m_peerFinder->on_closed(slot);
+                JLOG(journal.debug()) << "Peer " << remote_endpoint
+                                      << " redirected, slots full,result="
+                                      << (int)PeerFinder::Result::duplicate;
+                handoff.moved = false;
+                handoff.response = makeRedirectResponse(
+                    slot, request, remote_endpoint.address());
+                handoff.keep_alive = false;
+                return handoff;
             }
 
             // The node gets a reserved slot if it is in our cluster
@@ -540,8 +535,42 @@ OverlayImpl::remove(std::shared_ptr<PeerFinder::Slot> const& slot)
 {
     std::lock_guard lock(mutex_);
     auto const iter = m_peers.find(slot);
-    assert(iter != m_peers.end());
-    m_peers.erase(iter);
+    if (iter != m_peers.end())
+        m_peers.erase(iter);
+}
+
+bool
+OverlayImpl::evictStaleDuplicate(
+    PublicKey const& nodeKey,
+    boost::optional<PublicKey> const& valKey)
+{
+    std::shared_ptr<PeerImp> stale;
+    bool live = false;
+
+    for_each([&](std::shared_ptr<PeerImp>&& peer) {
+        bool const sameNode = peer->getNodePublic() == nodeKey;
+        bool const sameVal = valKey && peer->getValPublic() &&
+            *peer->getValPublic() == *valKey;
+        if (!sameNode && !sameVal)
+            return;
+        if (peer->isAlive())
+            live = true;
+        else
+            stale = std::move(peer);
+    });
+
+    if (stale)
+    {
+        JLOG(journal_.warn())
+            << "Evicting stale peer " << stale->getRemoteAddress()
+            << " node="
+            << toBase58(TokenType::NodePublic, stale->getNodePublic())
+            << " to accept reconnect";
+        stale->releaseSlot();
+        stale->fail("Stale connection replaced by reconnect");
+    }
+
+    return !live;
 }
 
 //------------------------------------------------------------------------------

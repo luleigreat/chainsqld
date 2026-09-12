@@ -26,6 +26,7 @@
 #include <ripple/basics/chrono.h>
 #include <ripple/core/Job.h>
 #include <ripple/overlay/Overlay.h>
+#include <ripple/protocol/PublicKey.h>
 #include <ripple/overlay/impl/Handshake.h>
 #include <ripple/overlay/impl/TrafficCount.h>
 #include <ripple/peerfinder/PeerfinderManager.h>
@@ -235,6 +236,14 @@ public:
 
     void
     remove(std::shared_ptr<PeerFinder::Slot> const& slot);
+
+    /** Evict a dead peer that still occupies the same node/validate public key.
+        @return false if a live duplicate exists (caller should reject).
+    */
+    bool
+    evictStaleDuplicate(
+        PublicKey const& nodeKey,
+        boost::optional<PublicKey> const& valKey);
 
     /** Called when a peer has connected successfully
         This is called after the peer handshake has been completed and during

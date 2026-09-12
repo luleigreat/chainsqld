@@ -393,14 +393,8 @@ ConnectAttempt::processResponse()
         JLOG(journal_.debug())
             << "Protocol: " << to_string(*negotiatedProtocol);
 
-        for (auto const& peer : overlay_.getActivePeers())
-        {
-            if (publicValidate && peer->getValPublic() &&
-                *peer->getValPublic() == *publicValidate)
-            {
-                return fail("Outbound slots full");
-            }
-        }
+        if (!overlay_.evictStaleDuplicate(publicKey, publicValidate))
+            return fail("Outbound slots full");
 
         auto const member = app_.cluster().member(publicKey);
         if (member)

@@ -106,10 +106,13 @@ PeerImp::~PeerImp()
 {
     const bool inCluster{cluster()};
 
-    if (state_ == State::active)
-        overlay_.onPeerDeactivate(id_);
-    overlay_.peerFinder().on_closed(slot_);
-    overlay_.remove(slot_);
+    if (!slotReleased_.exchange(true))
+    {
+        if (state_ == State::active)
+            overlay_.onPeerDeactivate(id_);
+        overlay_.peerFinder().on_closed(slot_);
+        overlay_.remove(slot_);
+    }
 
     if (inCluster)
     {
@@ -624,25 +627,34 @@ PeerImp::hasRange(
 //------------------------------------------------------------------------------
 
 void
+PeerImp::releaseSlot()
+{
+    if (slotReleased_.exchange(true))
+        return;
+
+    if (state_ == State::active)
+        overlay_.onPeerDeactivate(id_);
+    overlay_.peerFinder().on_closed(slot_);
+    overlay_.remove(slot_);
+}
+
+void
 PeerImp::close()
 {
     assert(strand_.running_in_this_thread());
+    detaching_ = true;
+    error_code ec;
+    timer_.cancel(ec);
     if (socket_.is_open())
     {
-        detaching_ = true;  // DEPRECATED
-        error_code ec;
-        timer_.cancel(ec);
         socket_.close(ec);
         overlay_.incPeerDisconnect();
-        if (m_inbound)
-        {
-            JLOG(journal_.info()) << remote_address_ << " Closed";
-        }
-        else
-        {
-            JLOG(journal_.info()) << remote_address_ << " Closed";
-        }
+        JLOG(journal_.info()) << remote_address_ << " Closed";
     }
+    // Always drop the PeerFinder key, even if the socket is already gone.
+    // Otherwise a dead PeerImp keeps occupying node/validate public keys
+    // and rejects the peer after it restarts.
+    releaseSlot();
 }
 
 void
@@ -814,11 +826,16 @@ PeerImp::makePrefix(id_t id)
 void
 PeerImp::onTimer(error_code const& ec)
 {
-    if (!socket_.is_open())
-        return;
-
     if (ec == boost::asio::error::operation_aborted)
         return;
+
+    if (!socket_.is_open())
+    {
+        JLOG(journal_.warn())
+            << remote_address_ << " timer: socket already closed";
+        fail("Socket closed");
+        return;
+    }
 
     if (ec)
     {
