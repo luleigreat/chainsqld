@@ -217,19 +217,36 @@ PopConsensus::gotTxSet(NetClock::time_point const& now, TxSet_t const& txSet)
     {
         auto set = txSet.map_->snapShot(false);
         // this place has a txSet copy,what's the time it costs?
-        result_.emplace(Result(
-            std::move(set),
-            RCLCxPeerPos::Proposal(
-                RCLCxPeerPos::Proposal::seqJoin,
-                id,
-                prevLedgerID_,
-                closeTime_,
-                now,
-                adaptor_.nodeID(),
-                adaptor_.valPublic(),
-                previousLedger_.seq() + 1,
-                view_,
-                RCLTxSet(nullptr))));
+        if (adaptor_.validating())
+        {
+            result_.emplace(Result(
+                std::move(set),
+                RCLCxPeerPos::Proposal(
+                    RCLCxPeerPos::Proposal::seqJoin,
+                    id,
+                    prevLedgerID_,
+                    closeTime_,
+                    now,
+                    adaptor_.nodeID(),
+                    adaptor_.valPublic(),
+                    previousLedger_.seq() + 1,
+                    view_,
+                    RCLTxSet(nullptr))));
+        }
+        else
+        {
+            // Watching nodes have no validation key. Reuse the leader
+            // proposal as the local position; doAccept only needs txns
+            // and closeTime.
+            if (!leaderProposal_)
+            {
+                JLOG(j_.error())
+                    << "Watching node got tx set but has no leader proposal";
+                return;
+            }
+            result_.emplace(
+                Result(std::move(set), STProposeSet(*leaderProposal_)));
+        }
 
         if (phase_ == ConsensusPhase::open)
             phase_ = ConsensusPhase::establish;
@@ -511,6 +528,7 @@ PopConsensus::startRoundInternal(
     txSetVoted_.clear();
     transactions_.clear();
     setID_.reset();
+    leaderProposal_.reset();
     lastTxSetSize_ = 0;
     leaderFailed_ = false;
     extraTimeOut_ = false;
@@ -1047,6 +1065,7 @@ PopConsensus::peerProposalInternal(
                 }
 
                 extraTimeOut_ = true;
+                leaderProposal_ = newPeerProp;
             }
             else
             {
@@ -1301,6 +1320,7 @@ PopConsensus::onViewChange(uint64_t toView)
     txSetVoted_.clear();
     transactions_.clear();
     setID_.reset();
+    leaderProposal_.reset();
     lastTxSetSize_ = 0;
     leaderFailed_ = false;
     extraTimeOut_ = false;

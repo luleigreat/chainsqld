@@ -74,6 +74,10 @@ private:
     // current setID proposed by leader.
     boost::optional<typename TxSet_t::ID> setID_;
 
+    // Leader's proposal for this round. Watching nodes reuse it as
+    // Result.position so they never construct STProposeSet with valPublic().
+    boost::optional<Proposal_t> leaderProposal_;
+
     ConsensusCloseTimes rawCloseTimes_;
 
     // Transaction hashes that have packaged in packaging block.
