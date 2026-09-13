@@ -294,7 +294,10 @@ LedgerMaster::onConsensusReached(
         }
     }
     checkSubChains();
-    checkLoadLedger();
+    // Do not walk or acquire the loaded tip. The NodeStore already backs
+    // SHAMap reads; checkLoadLedger only warms FullBelowCache and can pin
+    // the disk for hours, during which inbound and consensus starve.
+    JLOG(m_journal.info()) << "skip checkLoadLedger; state pages load on demand";
     app_.getTableSync().TryTableSync();
     app_.getTableSync().InitTableItems();
     tryAdvance();
