@@ -45,6 +45,7 @@
 #include <peersafe/schema/Schema.h>
 
 #include <mutex>
+#include <vector>
 
 namespace ripple {
 
@@ -185,7 +186,10 @@ public:
 
         Prefers a local copy, then header+tx replay. If the parent of the
         target is missing, walks parentHash toward the local tip and replays
-        the oldest missing ledger (valid+1, then +2, ...). Never starts
+        the oldest missing ledger (valid+1, then +2, ...). Remembers the
+        hash path so the next job continues from the oldest position and
+        the next child after a successful replay. Stops if the walk passes
+        the local executable ledger with a different hash. Never starts
         Reason::CONSENSUS / GENERIC inbound for a jumped tip.
     */
     std::shared_ptr<Ledger const>
@@ -400,6 +404,24 @@ private:
     std::shared_ptr<Ledger const>
     replayHeader(uint256 const& hash);
 
+    void
+    clearConsensusWalk();
+
+    void
+    touchConsensusWalkPath();
+
+    std::shared_ptr<Ledger const>
+    localWalkParent();
+
+    bool
+    consensusWalkWrongChain(
+        uint256 const& cur,
+        std::uint32_t curSeq,
+        uint256 const& parentHash);
+
+    void
+    joinConsensusWalk(uint256 const& hash);
+
     std::shared_ptr<Ledger const>
     replayFromHeaderTx(
         std::shared_ptr<Ledger const> const& parent,
@@ -492,6 +514,11 @@ private:
 
     // One jtADVANCE job for consensus replay chain at a time.
     std::atomic_bool mConsensusAcquireJob{false};
+
+    // parentHash path: network tip first, oldest missing last.
+    uint256 mConsensusWalkTip;
+    std::vector<uint256> mConsensusWalkPath;
+    std::uint32_t mConsensusWalkSeq{0};
 
     // Publish thread has work to do.
     bool mAdvanceWork{false};

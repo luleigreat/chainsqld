@@ -94,12 +94,21 @@ getLedgerByHash(hash)
   失败 → 只启动 REPLAY 要头（或等下轮）；禁止 CONSENSUS
          头到了再走下面
 
-从目标 hash 沿 header.parentHash 往回走（每轮最多 256 步）：
-  当前本已在本地 → 若是目标则返回；否则停止本轮
-  无 header → REPLAY 当前 hash（只要头+tx），返回 none
+从目标 hash 沿 header.parentHash 往回走。总距离不封顶（须能走过 527 / 1000）：
+  记住整条 path（tip → 最老）。下一轮从最老继续，不从 tip 重扫
+  每轮最多 256 步（本 job 预算）；撞预算一条 WRN：`walk budget local=… network=… walked=256`
+  已缓存 header 不再每步打 `Skip … walk parent`
+  每轮 touch path 上未失败的 REPLAY inbound，避免 1 分钟 sweep
+  failed inbound 要 erase 再 acquire，不能 touch 续命
+  重放成功只 pop 最老一本，下一本用 path 里的 child，不再从 tip 重走
+  重放成功或已拿到 tip 时 tryAdvance，published 跟 +1，避免 MAX_LEDGER_GAP 跳号
+  新 tip 先接到已有 path（parent 已在 path / 短距离 join）；接不上仍继续最老一本
+  `curSeq < local` 或同高 hash 不同或 `valid+1` 的 parent ≠ 本地 → `walk wrong-chain` 停
+  当前本已在本地 → 若是目标则返回；否则 pop 已齐后缀，从 path 下一本继续
+  无 header → REPLAY 当前 hash（只要头+tx），记住 walk 位置，返回 none
   parentHash 已在本地 → tryReplayLedger(当前)（通常是 valid+1）
                          一次 job 只重放一本，下轮再往前
-  parent 不在 → 当前 = parentHash，继续走
+  parent 不在 → 当前 = parentHash，push 进 path，继续走
 
 共识线程只 getLedgerByHash + requestAcquireForConsensus（jtADVANCE）。
 禁止 acquire(CONSENSUS)。不要指望 tryAdvance 的 pub+1…valid
@@ -157,6 +166,8 @@ getLedgerByHash(hash)
    - `Need consensus ledger` 保留，后面跟 `replay` / `wait-parent` / `cold-inbound`
    - 重放成功复用 `replayFromHeaderTx built`
    - 跳过整本：`Skip consensus inbound <hash> seq=…; no parent, wait sequential replay`
+   - 本轮步数用尽：`Need consensus ledger <hash> walk budget local=… network=… walked=256`
+   - 错链刹车：`Need consensus ledger <hash> walk wrong-chain local=… at <cur> seq=…`
 
 不改：`buildLedger`、`TxSet`、`published` / TableSync、`tryFill`、LedgerCleaner、HISTORY 的 peer 范围跳过。
 

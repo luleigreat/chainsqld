@@ -672,6 +672,14 @@ LedgerMaster::ensureReplayInbound(uint256 const& hash, std::uint32_t seq)
         app_.getInboundLedgers().erase(hash);
         inbound = {};
     }
+    if (inbound && inbound->isFailed())
+    {
+        JLOG(m_journal.warn())
+            << "Need consensus ledger " << hash
+            << " replay (header); retry failed inbound seq=" << seq;
+        app_.getInboundLedgers().erase(hash);
+        inbound = {};
+    }
     if (!inbound)
     {
         JLOG(m_journal.warn())
@@ -688,10 +696,159 @@ LedgerMaster::replayHeader(uint256 const& hash)
     auto inbound = app_.getInboundLedgers().find(hash);
     if (!inbound || inbound->getReason() != InboundLedger::Reason::REPLAY)
         return {};
+    if (inbound->isFailed())
+        return {};
     auto header = inbound->getLedger();
     if (!header || header->info().seq == 0)
         return {};
+    inbound->touch();
     return header;
+}
+
+void
+LedgerMaster::clearConsensusWalk()
+{
+    mConsensusWalkTip = uint256();
+    mConsensusWalkPath.clear();
+    mConsensusWalkSeq = 0;
+}
+
+void
+LedgerMaster::touchConsensusWalkPath()
+{
+    for (auto const& h : mConsensusWalkPath)
+    {
+        if (h.isZero())
+            continue;
+        if (auto inbound = app_.getInboundLedgers().find(h))
+        {
+            if (!inbound->isFailed())
+                inbound->touch();
+        }
+    }
+}
+
+std::shared_ptr<Ledger const>
+LedgerMaster::localWalkParent()
+{
+    if (auto v = getValidatedLedger())
+        return v;
+    return getClosedLedger();
+}
+
+bool
+LedgerMaster::consensusWalkWrongChain(
+    uint256 const& cur,
+    std::uint32_t curSeq,
+    uint256 const& parentHash)
+{
+    auto const local = localWalkParent();
+    if (!local || curSeq == 0)
+        return false;
+    auto const localSeq = local->info().seq;
+    if (curSeq < localSeq)
+        return true;
+    if (curSeq == localSeq)
+        return cur != local->info().hash;
+    if (curSeq == localSeq + 1)
+        return parentHash != local->info().hash;
+    return false;
+}
+
+void
+LedgerMaster::joinConsensusWalk(uint256 const& hash)
+{
+    if (hash.isZero() || mConsensusWalkPath.empty() ||
+        mConsensusWalkTip == hash)
+        return;
+
+    auto indexOf = [this](uint256 const& h) -> int {
+        for (std::size_t i = 0; i < mConsensusWalkPath.size(); ++i)
+        {
+            if (mConsensusWalkPath[i] == h)
+                return static_cast<int>(i);
+        }
+        return -1;
+    };
+
+    auto spliceAt = [this, &hash](
+                        int i, std::vector<uint256> const& prefix) {
+        std::vector<uint256> joined = prefix;
+        joined.insert(
+            joined.end(),
+            mConsensusWalkPath.begin() + i,
+            mConsensusWalkPath.end());
+        mConsensusWalkPath.swap(joined);
+        mConsensusWalkTip = hash;
+    };
+
+    if (int const i = indexOf(hash); i >= 0)
+    {
+        spliceAt(i, {});
+        return;
+    }
+
+    auto header = replayHeader(hash);
+    if (!header)
+    {
+        ensureReplayInbound(hash, seqForConsensusHash(hash));
+        return;
+    }
+
+    if (int const pi = indexOf(header->info().parentHash); pi >= 0)
+    {
+        spliceAt(pi, {hash});
+        return;
+    }
+
+    if (getLedgerByHash(header->info().parentHash))
+    {
+        mConsensusWalkPath = {hash};
+        mConsensusWalkTip = hash;
+        mConsensusWalkSeq = header->info().seq;
+        return;
+    }
+
+    constexpr int kJoinBudget = 32;
+    std::vector<uint256> prefix{hash};
+    auto cur = header->info().parentHash;
+    auto curSeq = header->info().seq - 1;
+    for (int step = 0; step < kJoinBudget; ++step)
+    {
+        if (int const i = indexOf(cur); i >= 0)
+        {
+            spliceAt(i, prefix);
+            return;
+        }
+
+        auto const h = replayHeader(cur);
+        if (!h)
+        {
+            ensureReplayInbound(cur, curSeq);
+            return;
+        }
+        curSeq = h->info().seq;
+        auto const parentHash = h->info().parentHash;
+        if (consensusWalkWrongChain(cur, curSeq, parentHash))
+        {
+            JLOG(m_journal.warn())
+                << "Need consensus ledger " << hash
+                << " join wrong-chain at " << cur << " seq=" << curSeq
+                << " local=" << getValidLedgerIndex();
+            return;
+        }
+        if (getLedgerByHash(parentHash))
+        {
+            prefix.push_back(cur);
+            mConsensusWalkPath = std::move(prefix);
+            mConsensusWalkTip = hash;
+            mConsensusWalkSeq = curSeq;
+            return;
+        }
+        prefix.push_back(cur);
+        cur = parentHash;
+        curSeq = curSeq - 1;
+    }
 }
 
 void
@@ -723,27 +880,82 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
         return {};
 
     if (auto have = getLedgerByHash(hash))
+    {
+        clearConsensusWalk();
+        tryAdvance();
         return have;
+    }
 
-    auto cur = hash;
-    auto curSeq = seqForConsensusHash(hash);
+    joinConsensusWalk(hash);
+
+    if (mConsensusWalkPath.empty())
+    {
+        mConsensusWalkPath.push_back(hash);
+        mConsensusWalkTip = hash;
+        mConsensusWalkSeq = seqForConsensusHash(hash);
+    }
+
+    while (!mConsensusWalkPath.empty() &&
+           getLedgerByHash(mConsensusWalkPath.back()))
+        mConsensusWalkPath.pop_back();
+
+    if (mConsensusWalkPath.empty())
+    {
+        if (auto have = getLedgerByHash(hash))
+        {
+            tryAdvance();
+            return have;
+        }
+        mConsensusWalkPath.push_back(hash);
+        mConsensusWalkTip = hash;
+        mConsensusWalkSeq = seqForConsensusHash(hash);
+    }
+
+    touchConsensusWalkPath();
+
+    auto cur = mConsensusWalkPath.back();
+    auto curSeq = mConsensusWalkSeq;
+    if (curSeq == 0)
+        curSeq = seqForConsensusHash(cur);
+
     if (curSeq == 0)
     {
-        ensureReplayInbound(hash, 0);
+        ensureReplayInbound(cur, 0);
         tryAdvance();
         return {};
     }
 
     // Walk parentHash toward the local tip. Replay the oldest missing
     // ledger whose parent is already local (typically valid+1).
-    constexpr int kMaxWalk = 256;
-    for (int step = 0; step < kMaxWalk; ++step)
+    // kWalkBudget is per job only; total distance is unbounded.
+    constexpr int kWalkBudget = 256;
+    int walked = 0;
+    for (; walked < kWalkBudget; ++walked)
     {
         if (auto have = getLedgerByHash(cur))
         {
             if (cur == hash)
+            {
+                clearConsensusWalk();
+                tryAdvance();
                 return have;
-            break;
+            }
+            while (!mConsensusWalkPath.empty() &&
+                   getLedgerByHash(mConsensusWalkPath.back()))
+                mConsensusWalkPath.pop_back();
+            if (mConsensusWalkPath.empty())
+            {
+                tryAdvance();
+                return getLedgerByHash(hash);
+            }
+            cur = mConsensusWalkPath.back();
+            curSeq = seqForConsensusHash(cur);
+            if (curSeq == 0)
+            {
+                ensureReplayInbound(cur, 0);
+                return {};
+            }
+            continue;
         }
 
         if (curSeq <= 1)
@@ -751,6 +963,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
             JLOG(m_journal.warn())
                 << "Skip consensus inbound " << hash << " seq=" << curSeq
                 << "; no parent, wait sequential replay";
+            clearConsensusWalk();
             tryAdvance();
             return {};
         }
@@ -759,27 +972,67 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
         if (!header)
         {
             ensureReplayInbound(cur, curSeq);
+            mConsensusWalkSeq = curSeq;
             return {};
         }
         curSeq = header->info().seq;
         auto const parentHash = header->info().parentHash;
+        mConsensusWalkSeq = curSeq;
+
+        if (consensusWalkWrongChain(cur, curSeq, parentHash))
+        {
+            JLOG(m_journal.warn())
+                << "Need consensus ledger " << hash
+                << " walk wrong-chain local=" << getValidLedgerIndex()
+                << " at " << cur << " seq=" << curSeq;
+            clearConsensusWalk();
+            tryAdvance();
+            return {};
+        }
 
         if (getLedgerByHash(parentHash))
         {
             JLOG(m_journal.warn())
                 << "Need consensus ledger " << hash
                 << " replay chain at " << cur << " seq=" << curSeq;
-            tryReplayLedger(cur, curSeq);
+            if (tryReplayLedger(cur, curSeq))
+            {
+                if (!mConsensusWalkPath.empty() &&
+                    mConsensusWalkPath.back() == cur)
+                {
+                    mConsensusWalkPath.pop_back();
+                    if (mConsensusWalkPath.empty())
+                        mConsensusWalkSeq = 0;
+                    else if (
+                        auto const child =
+                            replayHeader(mConsensusWalkPath.back()))
+                        mConsensusWalkSeq = child->info().seq;
+                    else
+                        mConsensusWalkSeq = curSeq + 1;
+                }
+                touchConsensusWalkPath();
+                tryAdvance();
+                return getLedgerByHash(hash);
+            }
+            touchConsensusWalkPath();
             return getLedgerByHash(hash);
         }
 
-        JLOG(m_journal.warn())
-            << "Skip consensus inbound " << hash << " seq=" << curSeq
-            << "; walk parent " << parentHash;
         cur = parentHash;
         curSeq = curSeq - 1;
+        if (mConsensusWalkPath.empty() || mConsensusWalkPath.back() != cur)
+            mConsensusWalkPath.push_back(cur);
+        mConsensusWalkSeq = curSeq;
     }
 
+    auto netSeq = seqForConsensusHash(hash);
+    if (netSeq == 0)
+        netSeq = curSeq;
+    JLOG(m_journal.warn())
+        << "Need consensus ledger " << hash
+        << " walk budget local=" << getValidLedgerIndex()
+        << " network=" << netSeq << " walked=" << walked;
+    touchConsensusWalkPath();
     tryAdvance();
     return getLedgerByHash(hash);
 }
