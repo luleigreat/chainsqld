@@ -160,7 +160,8 @@ InboundLedger::init(ScopedLockType& collectionLock)
                             << " local store. " << mHash;
     mLedger->setImmutable(app_.config());
 
-    if (mReason == Reason::HISTORY || mReason == Reason::SHARD)
+    if (mReason == Reason::HISTORY || mReason == Reason::SHARD ||
+        mReason == Reason::REPLAY)
         return;
 
     app_.getInboundLedgers().onLedgerComplete(getSeq());
@@ -423,7 +424,7 @@ InboundLedger::tryDB(NodeStore::Database& srcDB)
         }
     }
 
-    if (!mHaveState)
+    if (!mHaveState && mReason != Reason::REPLAY)
     {
         if (mLedger->info().accountHash.isZero())
         {
@@ -448,7 +449,7 @@ InboundLedger::tryDB(NodeStore::Database& srcDB)
         }
     }
 
-    if (!mHaveContracts)
+    if (!mHaveContracts && mReason != Reason::REPLAY)
     {
         if (checkLoadContractRoots())
         {
@@ -579,6 +580,9 @@ InboundLedger::done()
             case Reason::HISTORY:
                 app_.getInboundLedgers().onLedgerFetched();
                 break;
+            case Reason::REPLAY:
+                // Header + tx only. Do not cache as a full ledger.
+                break;
             default:
                 app_.getLedgerMaster().storeLedger(mLedger);
                 break;
@@ -590,11 +594,16 @@ InboundLedger::done()
         jtLEDGER_DATA, "AcquisitionDone", [self = shared_from_this()](Job&) {
             if (self->mComplete && !self->mFailed)
             {
-                self->app_.getInboundLedgers().onLedgerComplete(self->getSeq());
-                if (self->app().getOPs().checkLedgerAccept(self->getLedger()))
+                if (self->getReason() != Reason::REPLAY)
                 {
-                    self->app().getLedgerMaster().doValid(self->getLedger());
-                    self->app().getLedgerMaster().checkUpdateOpenLedger();
+                    self->app_.getInboundLedgers().onLedgerComplete(
+                        self->getSeq());
+                    if (self->app().getOPs().checkLedgerAccept(
+                            self->getLedger()))
+                    {
+                        self->app().getLedgerMaster().doValid(self->getLedger());
+                        self->app().getLedgerMaster().checkUpdateOpenLedger();
+                    }
                 }
                 self->app().getLedgerMaster().tryAdvance();
             }
@@ -742,8 +751,8 @@ InboundLedger::trigger(std::shared_ptr<Peer> const& peer, TriggerReason reason)
         tmGL.set_querydepth(1);
 
     // Get the state data first because it's the most likely to be useful
-    // if we wind up abandoning this fetch.
-    if (mHaveHeader && !mHaveState && !mFailed)
+    // if we wind up abandoning this fetch. Replay only needs header + tx.
+    if (mHaveHeader && !mHaveState && !mFailed && mReason != Reason::REPLAY)
     {
         assert(mLedger);
 
@@ -879,6 +888,18 @@ InboundLedger::trigger(std::shared_ptr<Peer> const& peer, TriggerReason reason)
                 }
             }
         }
+    }
+
+    if (mReason == Reason::REPLAY)
+    {
+        if (checkComplete())
+            mComplete = true;
+        if (mComplete || mFailed)
+        {
+            sl.unlock();
+            done();
+        }
+        return;
     }
 
     if (mCheckingContract.exchange(true))
@@ -1017,10 +1038,13 @@ InboundLedger::checkComplete()
 {
     if (mComplete)
         return true;
-    
-    return mHaveContracts && 
-           mHaveHeader && 
-           mHaveState && 
+
+    if (mReason == Reason::REPLAY)
+        return mHaveHeader && mHaveTransactions;
+
+    return mHaveContracts &&
+           mHaveHeader &&
+           mHaveState &&
            mHaveTransactions;
 }
 

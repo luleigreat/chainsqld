@@ -21,7 +21,9 @@
 #include <ripple/app/ledger/Ledger.h>
 #include <ripple/app/ledger/LedgerMaster.h>
 #include <ripple/app/ledger/TransactionMaster.h>
+#include <ripple/app/ledger/BuildLedger.h>
 #include <ripple/app/ledger/InboundLedgers.h>
+#include <ripple/app/ledger/LedgerReplay.h>
 #include <ripple/app/ledger/OpenLedger.h>
 #include <ripple/app/ledger/OrderBookDB.h>
 #include <ripple/app/ledger/PendingSaves.h>
@@ -36,6 +38,8 @@
 #include <ripple/app/misc/ValidatorList.h>
 #include <ripple/app/paths/PathRequests.h>
 #include <ripple/app/tx/apply.h>
+#include <ripple/ledger/ApplyView.h>
+#include <ripple/shamap/SHAMapMissingNode.h>
 #include <ripple/basics/Log.h>
 #include <ripple/basics/MathUtilities.h>
 #include <ripple/basics/TaggedCache.h>
@@ -452,6 +456,104 @@ LedgerMaster::persistValidated(std::shared_ptr<Ledger const> const& ledger)
     }
 
     setFullLedger(ledger, false, true);
+}
+
+std::shared_ptr<Ledger const>
+LedgerMaster::replayFromHeaderTx(
+    std::shared_ptr<Ledger const> const& parent,
+    std::shared_ptr<Ledger const> const& headerTx,
+    uint256 const& expectedHash)
+{
+    if (!parent || !headerTx)
+        return {};
+
+    if (headerTx->info().parentHash != parent->info().hash)
+    {
+        JLOG(m_journal.warn())
+            << "replayFromHeaderTx parent hash mismatch seq="
+            << headerTx->info().seq;
+        return {};
+    }
+
+    try
+    {
+        LedgerReplay replayData(parent, headerTx);
+        auto built = buildLedger(
+            replayData,
+            tapNO_CHECK_SIGN | tapForConsensus,
+            app_,
+            m_journal);
+        if (!built || built->info().hash != expectedHash)
+        {
+            JLOG(m_journal.warn())
+                << "replayFromHeaderTx root mismatch seq="
+                << headerTx->info().seq << " built="
+                << (built ? to_string(built->info().hash) : "null")
+                << " expected=" << expectedHash;
+            return {};
+        }
+
+        persistValidated(built);
+        JLOG(m_journal.info())
+            << "replayFromHeaderTx built " << built->info().seq << " "
+            << built->info().hash;
+        return built;
+    }
+    catch (SHAMapMissingNode const& mn)
+    {
+        JLOG(m_journal.warn())
+            << "replayFromHeaderTx missing node seq=" << headerTx->info().seq
+            << " : " << mn.what();
+        return {};
+    }
+    catch (std::exception const& e)
+    {
+        JLOG(m_journal.warn())
+            << "replayFromHeaderTx exception seq=" << headerTx->info().seq
+            << " : " << e.what();
+        return {};
+    }
+}
+
+std::shared_ptr<Ledger const>
+LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
+{
+    if (hash.isZero() || seq <= 1)
+        return {};
+
+    auto parent = getLedgerBySeq(seq - 1);
+    if (!parent)
+    {
+        JLOG(m_journal.debug()) << "tryReplayLedger no parent for " << seq;
+        return {};
+    }
+
+    auto inbound = app_.getInboundLedgers().find(hash);
+    if (inbound && inbound->getReason() != InboundLedger::Reason::REPLAY)
+        return {};
+
+    if (!inbound)
+    {
+        app_.getInboundLedgers().acquire(
+            hash, seq, InboundLedger::Reason::REPLAY);
+        inbound = app_.getInboundLedgers().find(hash);
+    }
+
+    if (!inbound)
+        return {};
+
+    if (inbound->isFailed())
+    {
+        app_.getInboundLedgers().erase(hash);
+        return {};
+    }
+
+    if (!inbound->isComplete())
+        return {};
+
+    auto built = replayFromHeaderTx(parent, inbound->getLedger(), hash);
+    app_.getInboundLedgers().erase(hash);
+    return built;
 }
 
 bool
@@ -1570,10 +1672,21 @@ LedgerMaster::findNewLedgersToPublish(
                 ledger = mLedgerHistory.getLedgerByHash(*hash);
             }
 
-            // Can we try to acquire the ledger we need?
+            if (!ledger)
+                ledger = tryReplayLedger(*hash, seq);
+
+            // Full inbound only if replay cannot run or has already failed.
             if (!ledger && (++acqCount < ledger_fetch_size_))
-                ledger = app_.getInboundLedgers().acquire(
-                    *hash, seq, InboundLedger::Reason::GENERIC);
+            {
+                auto inbound = app_.getInboundLedgers().find(*hash);
+                bool const replayPending =
+                    inbound &&
+                    inbound->getReason() == InboundLedger::Reason::REPLAY &&
+                    !inbound->isFailed();
+                if (!replayPending)
+                    ledger = app_.getInboundLedgers().acquire(
+                        *hash, seq, InboundLedger::Reason::GENERIC);
+            }
 
             // Did we acquire the next ledger we need to publish?
             if (ledger && (ledger->info().seq == pubSeq))

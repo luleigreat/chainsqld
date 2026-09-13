@@ -108,6 +108,12 @@ public:
         if (!inbound->isComplete())
             return {};
 
+        // Replay fetches are header+tx only and must not be treated as a
+        // complete ledger by GENERIC / CONSENSUS callers.
+        if (inbound->getReason() == InboundLedger::Reason::REPLAY &&
+            reason != InboundLedger::Reason::REPLAY)
+            return {};
+
         if (reason == InboundLedger::Reason::HISTORY)
         {
             if (inbound->getLedger()->stateMap().family().isShardBacked())
@@ -148,6 +154,13 @@ public:
         }
 
         return ret;
+    }
+
+    void
+    erase(LedgerHash const& hash) override
+    {
+        ScopedLockType sl(mLock);
+        mLedgers.erase(hash);
     }
 
     /*

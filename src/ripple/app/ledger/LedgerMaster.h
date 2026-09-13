@@ -374,6 +374,15 @@ private:
     void
     persistValidated(std::shared_ptr<Ledger const> const& ledger);
 
+    std::shared_ptr<Ledger const>
+    tryReplayLedger(uint256 const& hash, std::uint32_t seq);
+
+    std::shared_ptr<Ledger const>
+    replayFromHeaderTx(
+        std::shared_ptr<Ledger const> const& parent,
+        std::shared_ptr<Ledger const> const& headerTx,
+        uint256 const& expectedHash);
+
     void
     tryFill(Job& job, std::shared_ptr<Ledger const> ledger);
 

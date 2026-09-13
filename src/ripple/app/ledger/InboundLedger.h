@@ -54,7 +54,8 @@ public:
         HISTORY,   // Acquiring past ledger
         SHARD,     // Acquiring for shard
         GENERIC,   // Generic other reasons
-        CONSENSUS  // We believe the consensus round requires this ledger
+        CONSENSUS, // We believe the consensus round requires this ledger
+        REPLAY     // Header + tx tree only, for parent-based buildLedger
     };
 
     InboundLedger(
@@ -94,6 +95,12 @@ public:
     getSeq() const
     {
         return mSeq;
+    }
+
+    Reason
+    getReason() const
+    {
+        return mReason;
     }
 
     bool
