@@ -366,6 +366,14 @@ private:
     void
     setPubLedger(std::shared_ptr<Ledger const> const& l);
 
+    /** Persist a validated ledger immediately (header, history, complete_ledgers).
+
+        Does not advance published / TableSync. Transaction SQL may be async.
+        Safe to call more than once for the same ledger.
+    */
+    void
+    persistValidated(std::shared_ptr<Ledger const> const& ledger);
+
     void
     tryFill(Job& job, std::shared_ptr<Ledger const> ledger);
 

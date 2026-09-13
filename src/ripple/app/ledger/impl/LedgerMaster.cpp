@@ -434,6 +434,23 @@ LedgerMaster::setPubLedger(std::shared_ptr<Ledger const> const& l)
     mPubLedgerSeq = l->info().seq;
 }
 
+void
+LedgerMaster::persistValidated(std::shared_ptr<Ledger const> const& ledger)
+{
+    // Header + Ledgers row first so a crash still leaves the ledger reloadable.
+    // complete_ledgers only advances after that succeeds. Published / TableSync
+    // stay on the sequential tryAdvance path.
+    if (!storeValidatedLedgerHeader(app_, ledger))
+    {
+        JLOG(m_journal.error())
+            << "persistValidated: header store failed for "
+            << ledger->info().seq << " " << ledger->info().hash;
+        return;
+    }
+
+    setFullLedger(ledger, false, true);
+}
+
 bool
 LedgerMaster::addHeldTransaction(
     std::shared_ptr<Transaction> const& transaction,
@@ -2111,9 +2128,12 @@ LedgerMaster::doValid(std::shared_ptr<Ledger const> const& ledger)
     app_.getTxPool().removeTxs(
         ledger->txMap(), ledger->info().seq, ledger->info().parentHash);
 
+    // Persist on validate so checkLoadLedger / publish lag cannot drop
+    // consensus ledgers from disk or complete_ledgers.
+    persistValidated(ledger);
+
     if (!mPubLedger)
     {
-        pendSaveValidated(app_, ledger, true, true);
         setPubLedger(ledger);
         //app_.getOrderBookDB().setup(ledger);
     }

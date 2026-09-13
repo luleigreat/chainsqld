@@ -1250,6 +1250,87 @@ saveValidatedLedger(
     return true;
 }
 
+bool
+storeValidatedLedgerHeader(
+    Schema& app,
+    std::shared_ptr<Ledger const> const& ledger)
+{
+    auto j = app.journal("Ledger");
+    auto seq = ledger->info().seq;
+
+    if (!ledger->info().accountHash.isNonZero())
+    {
+        JLOG(j.fatal()) << "AH is zero: " << getJson(*ledger);
+        return false;
+    }
+
+    if (ledger->info().accountHash != ledger->stateMap().getHash().as_uint256())
+    {
+        JLOG(j.fatal()) << "storeValidatedLedgerHeader: " << ledger->info().accountHash
+                        << " != " << ledger->stateMap().getHash();
+        return false;
+    }
+
+    if (ledger->info().txHash != ledger->txMap().getHash().as_uint256())
+    {
+        JLOG(j.fatal()) << "storeValidatedLedgerHeader: txHash mismatch seq="
+                        << seq;
+        return false;
+    }
+
+    {
+        Serializer s(128);
+        s.add32(HashPrefix::ledgerMaster);
+        addRaw(ledger->info(), s);
+        app.getNodeStore().store(
+            hotLEDGER, std::move(s.modData()), ledger->info().hash, seq);
+    }
+
+    try
+    {
+        static std::string const addLedger(
+            R"sql(INSERT OR REPLACE INTO Ledgers
+                (LedgerHash,LedgerSeq,PrevHash,TotalCoins,ClosingTime,PrevClosingTime,
+                CloseTimeRes,CloseFlags,AccountSetHash,TransSetHash)
+            VALUES
+                (:ledgerHash,:ledgerSeq,:prevHash,:totalCoins,:closingTime,:prevClosingTime,
+                :closeTimeRes,:closeFlags,:accountSetHash,:transSetHash);)sql");
+
+        auto db(app.getLedgerDB().checkoutDb());
+        soci::transaction tr(*db);
+
+        auto const hash = to_string(ledger->info().hash);
+        auto const parentHash = to_string(ledger->info().parentHash);
+        auto const drops = to_string(ledger->info().drops);
+        auto const closeTime =
+            ledger->info().closeTime.time_since_epoch().count();
+        auto const parentCloseTime =
+            ledger->info().parentCloseTime.time_since_epoch().count();
+        auto const closeTimeResolution =
+            ledger->info().closeTimeResolution.count();
+        auto const closeFlags = ledger->info().closeFlags;
+        auto const accountHash = to_string(ledger->info().accountHash);
+        auto const txHash = to_string(ledger->info().txHash);
+
+        *db << addLedger, soci::use(hash), soci::use(seq),
+            soci::use(parentHash), soci::use(drops), soci::use(closeTime),
+            soci::use(parentCloseTime), soci::use(closeTimeResolution),
+            soci::use(closeFlags), soci::use(accountHash), soci::use(txHash);
+
+        tr.commit();
+    }
+    catch (std::exception const& e)
+    {
+        JLOG(j.error()) << "storeValidatedLedgerHeader SQL failed seq=" << seq
+                        << " : " << e.what();
+        return false;
+    }
+
+    JLOG(j.info()) << "storeValidatedLedgerHeader " << seq << " "
+                   << ledger->info().hash;
+    return true;
+}
+
 /** Save, or arrange to save, a fully-validated ledger
     Returns false on error
 */

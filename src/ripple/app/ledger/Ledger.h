@@ -444,6 +444,16 @@ pendSaveValidated(
     bool isSynchronous,
     bool isCurrent);
 
+/** Synchronously store the ledger header in NodeStore and the Ledgers SQL row.
+
+    Transaction index tables may still be written later by pendSaveValidated.
+    Returns false if the ledger is insane or the header could not be stored.
+*/
+extern bool
+storeValidatedLedgerHeader(
+    Schema& app,
+    std::shared_ptr<Ledger const> const& ledger);
+
 extern
 std::shared_ptr<Ledger>
 loadByIndex (std::uint32_t ledgerIndex,
