@@ -28,6 +28,7 @@
 #include <peersafe/schema/Schema.h>
 #include <peersafe/app/ledger/LedgerAdjust.h>
 #include <peersafe/app/misc/ContractHelper.h>
+#include <vector>
 
 namespace ripple {
 
@@ -240,8 +241,52 @@ buildLedger(
         app,
         j,
         [&](OpenView& accum, std::shared_ptr<Ledger> const& built) {
-            for (auto& tx : replayData.orderedTxns())
-                applyTransaction(app, accum, *tx.second, false, applyFlags, j);
+            std::vector<std::shared_ptr<STTx const>> pending;
+            pending.reserve(replayData.orderedTxns().size());
+            for (auto const& tx : replayData.orderedTxns())
+                pending.push_back(tx.second);
+
+            bool certainRetry = true;
+            int success = 0;
+            int fail = 0;
+            for (int pass = 0; pass < LEDGER_TOTAL_PASSES; ++pass)
+            {
+                int changes = 0;
+                auto it = pending.begin();
+                while (it != pending.end())
+                {
+                    try
+                    {
+                        switch (applyTransaction(
+                            app, accum, **it, certainRetry, applyFlags, j))
+                        {
+                            case ApplyResult::Success:
+                                it = pending.erase(it);
+                                ++changes;
+                                ++success;
+                                break;
+                            case ApplyResult::Fail:
+                                it = pending.erase(it);
+                                ++fail;
+                                break;
+                            case ApplyResult::Retry:
+                                ++it;
+                                break;
+                        }
+                    }
+                    catch (std::exception const&)
+                    {
+                        it = pending.erase(it);
+                        ++fail;
+                    }
+                }
+                if (!changes && !certainRetry)
+                    break;
+                if (!changes || (pass >= LEDGER_RETRY_PASSES))
+                    certainRetry = false;
+            }
+            fail += static_cast<int>(pending.size());
+            LedgerAdjust::updateTxCount(app, accum, success, fail);
         });
 }
 

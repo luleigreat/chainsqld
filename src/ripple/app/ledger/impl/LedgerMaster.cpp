@@ -506,9 +506,12 @@ LedgerMaster::replayFromHeaderTx(
                 << headerTx->info().seq << " built="
                 << (built ? to_string(built->info().hash) : "null")
                 << " expected=" << expectedHash;
+            mConsensusReplayMismatch = expectedHash;
             return {};
         }
 
+        if (mConsensusReplayMismatch == expectedHash)
+            mConsensusReplayMismatch = uint256();
         persistValidated(built);
         JLOG(m_journal.info())
             << "replayFromHeaderTx built " << built->info().seq << " "
@@ -535,6 +538,9 @@ std::shared_ptr<Ledger const>
 LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
 {
     if (hash.isZero() || seq <= 1)
+        return {};
+
+    if (hash == mConsensusReplayMismatch)
         return {};
 
     auto inbound = app_.getInboundLedgers().find(hash);
@@ -579,7 +585,8 @@ LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
     }
 
     auto built = replayFromHeaderTx(parent, headerTx, hash);
-    app_.getInboundLedgers().erase(hash);
+    if (hash != mConsensusReplayMismatch)
+        app_.getInboundLedgers().erase(hash);
     return built;
 }
 
@@ -971,7 +978,8 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
         auto header = replayHeader(cur);
         if (!header)
         {
-            ensureReplayInbound(cur, curSeq);
+            if (cur != mConsensusReplayMismatch)
+                ensureReplayInbound(cur, curSeq);
             mConsensusWalkSeq = curSeq;
             return {};
         }
@@ -992,6 +1000,11 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
 
         if (getLedgerByHash(parentHash))
         {
+            if (cur == mConsensusReplayMismatch)
+            {
+                touchConsensusWalkPath();
+                return getLedgerByHash(hash);
+            }
             JLOG(m_journal.warn())
                 << "Need consensus ledger " << hash
                 << " replay chain at " << cur << " seq=" << curSeq;
@@ -2164,7 +2177,7 @@ LedgerMaster::findNewLedgersToPublish(
                     inbound &&
                     inbound->getReason() == InboundLedger::Reason::REPLAY &&
                     !inbound->isFailed();
-                if (!replayPending)
+                if (!replayPending && *hash != mConsensusReplayMismatch)
                     ledger = app_.getInboundLedgers().acquire(
                         *hash, seq, InboundLedger::Reason::GENERIC);
             }

@@ -108,6 +108,8 @@ getLedgerByHash(hash)
   无 header → REPLAY 当前 hash（只要头+tx），记住 walk 位置，返回 none
   parentHash 已在本地 → tryReplayLedger(当前)（通常是 valid+1）
                          一次 job 只重放一本，下轮再往前
+  重放 apply 与共识对齐：retry pass + LedgerAdjust::updateTxCount
+  同一 hash root mismatch 只打一次，不再 erase 拉头重试
   parent 不在 → 当前 = parentHash，push 进 path，继续走
 
 共识线程只 getLedgerByHash + requestAcquireForConsensus（jtADVANCE）。
@@ -149,7 +151,7 @@ getLedgerByHash(hash)
 |---|---|---|
 | 父本不在 | 沿 parentHash 往回 REPLAY，先重放离本地最近的一本 | 对 tip CONSENSUS；只靠 pub+1…valid |
 | REPLAY 超时 / fail | 擦掉该 inbound，下轮再 REPLAY；连续失败再考虑回退 | 第一次失败就整本 tip |
-| Root 不对 | 日志 + 不 persist；可再 REPLAY 一次 | 把 headerTx 当完整账本 `doValid` |
+| Root 不对 | 日志 + 不 persist；记下 hash，不再拉头重放，也不升 GENERIC | 把 headerTx 当完整账本 `doValid`；200ms 死循环重试 |
 | `SHAMapMissingNode` | 按 hash 补该节点后重试该本（阶段 1 语义） | `acquire(当前 tip, CONSENSUS)` |
 | 本地无任何可执行状态 | **一次** 整本（冷启动） | 之后每轮再开整本 |
 | REPLAY 进行中 | 等 | `acquire` 升级为 CONSENSUS（`InboundLedgers` 已拒绝把 REPLAY 结果交给 CONSENSUS，但不要并存两种 reason） |

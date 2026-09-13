@@ -519,6 +519,7 @@ private:
     uint256 mConsensusWalkTip;
     std::vector<uint256> mConsensusWalkPath;
     std::uint32_t mConsensusWalkSeq{0};
+    uint256 mConsensusReplayMismatch;
 
     // Publish thread has work to do.
     bool mAdvanceWork{false};
