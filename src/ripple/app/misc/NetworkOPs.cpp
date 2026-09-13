@@ -1969,7 +1969,13 @@ NetworkOPsImp::apply(std::unique_lock<std::mutex>& batchLock)
                         if (ret)
                         {
                             JLOG(m_journal.info())
-                                << "Transaction should be held: " << e.result;
+                                << "Transaction should be held: " << e.result
+                                << ", accountId="
+                                << txCur->getAccountID(sfAccount)
+                                << ", curSeq=" << seq
+                                << ", tx.Sequence=" << txCur->getSequence()
+                                << ", tx.hash="
+                                << txCur->getTransactionID();
                             e.transaction->setStatus(HELD);
                             e.transaction->setKept();
                         }
@@ -2226,8 +2232,7 @@ NetworkOPsImp::checkLastClosedLedger(
     auto consensus = m_ledgerMaster.getLedgerByHash(closedLedger);
 
     if (!consensus)
-        consensus = app_.getInboundLedgers().acquire(
-            closedLedger, 0, InboundLedger::Reason::CONSENSUS);
+        m_ledgerMaster.requestAcquireForConsensus(closedLedger);
 
     if (consensus &&
         (!m_ledgerMaster.canBeCurrent(consensus, mConsensus.consensusType()) ||

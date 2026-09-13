@@ -18,8 +18,6 @@
 //==============================================================================
 
 #include <ripple/app/consensus/RCLValidations.h>
-#include <ripple/app/ledger/InboundLedger.h>
-#include <ripple/app/ledger/InboundLedgers.h>
 #include <ripple/app/ledger/LedgerMaster.h>
 #include <ripple/app/misc/NetworkOPs.h>
 #include <ripple/app/misc/ValidatorList.h>
@@ -274,14 +272,7 @@ RCLValidationsAdaptor::acquire(LedgerHash const& hash)
     {
         JLOG(j_.debug())
             << "Need validated ledger for preferred ledger analysis " << hash;
-
-        Schema* pApp = &app_;
-
-        app_.getJobQueue().addJob(
-            jtADVANCE, "getConsensusLedger", [pApp, hash](Job&) {
-                pApp->getInboundLedgers().acquire(
-                    hash, 0, InboundLedger::Reason::CONSENSUS);
-            }, app_.doJobCounter());
+        app_.getLedgerMaster().requestAcquireForConsensus(hash);
         return boost::none;
     }
 

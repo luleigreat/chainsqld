@@ -181,6 +181,20 @@ public:
     std::shared_ptr<Ledger const>
     getLedgerByHash(uint256 const& hash);
 
+    /** Obtain a ledger needed as consensus LCL.
+
+        Prefers a local copy, then header+tx replay. If the parent of the
+        target is missing, walks parentHash toward the local tip and replays
+        the oldest missing ledger (valid+1, then +2, ...). Never starts
+        Reason::CONSENSUS / GENERIC inbound for a jumped tip.
+    */
+    std::shared_ptr<Ledger const>
+    acquireForConsensus(uint256 const& hash);
+
+    /** Run acquireForConsensus on jtADVANCE. Safe from the consensus thread. */
+    void
+    requestAcquireForConsensus(uint256 const& hash);
+
     boost::optional<NetClock::time_point>
     getCloseTimeBySeq(LedgerIndex ledgerIndex);
     boost::optional<NetClock::time_point>
@@ -377,6 +391,15 @@ private:
     std::shared_ptr<Ledger const>
     tryReplayLedger(uint256 const& hash, std::uint32_t seq);
 
+    std::uint32_t
+    seqForConsensusHash(uint256 const& hash);
+
+    void
+    ensureReplayInbound(uint256 const& hash, std::uint32_t seq);
+
+    std::shared_ptr<Ledger const>
+    replayHeader(uint256 const& hash);
+
     std::shared_ptr<Ledger const>
     replayFromHeaderTx(
         std::shared_ptr<Ledger const> const& parent,
@@ -466,6 +489,9 @@ private:
 
     // Publish thread is running.
     std::atomic_bool mAdvanceThread{false};
+
+    // One jtADVANCE job for consensus replay chain at a time.
+    std::atomic_bool mConsensusAcquireJob{false};
 
     // Publish thread has work to do.
     bool mAdvanceWork{false};

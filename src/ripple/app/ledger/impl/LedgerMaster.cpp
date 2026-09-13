@@ -47,12 +47,14 @@
 #include <ripple/basics/contract.h>
 #include <ripple/basics/safe_cast.h>
 #include <ripple/core/DatabaseCon.h>
+#include <ripple/core/JobQueue.h>
 #include <ripple/core/TimeKeeper.h>
 #include <ripple/nodestore/DatabaseShard.h>
 #include <ripple/overlay/Overlay.h>
 #include <ripple/overlay/Peer.h>
 #include <ripple/protocol/BuildInfo.h>
 #include <ripple/protocol/HashPrefix.h>
+#include <ripple/protocol/SField.h>
 #include <ripple/protocol/digest.h>
 #include <ripple/resource/Fees.h>
 #include <peersafe/app/table/TableSync.h>
@@ -535,16 +537,14 @@ LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
     if (hash.isZero() || seq <= 1)
         return {};
 
-    auto parent = getLedgerBySeq(seq - 1);
-    if (!parent)
-    {
-        JLOG(m_journal.debug()) << "tryReplayLedger no parent for " << seq;
-        return {};
-    }
-
     auto inbound = app_.getInboundLedgers().find(hash);
     if (inbound && inbound->getReason() != InboundLedger::Reason::REPLAY)
-        return {};
+    {
+        JLOG(m_journal.warn())
+            << "tryReplayLedger drop non-REPLAY inbound " << hash;
+        app_.getInboundLedgers().erase(hash);
+        inbound = {};
+    }
 
     if (!inbound)
     {
@@ -565,9 +565,223 @@ LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
     if (!inbound->isComplete())
         return {};
 
-    auto built = replayFromHeaderTx(parent, inbound->getLedger(), hash);
+    auto headerTx = inbound->getLedger();
+    if (!headerTx)
+        return {};
+
+    auto parent = getLedgerByHash(headerTx->info().parentHash);
+    if (!parent)
+        parent = getLedgerBySeq(seq - 1);
+    if (!parent)
+    {
+        JLOG(m_journal.debug()) << "tryReplayLedger no parent for " << seq;
+        return {};
+    }
+
+    auto built = replayFromHeaderTx(parent, headerTx, hash);
     app_.getInboundLedgers().erase(hash);
     return built;
+}
+
+std::uint32_t
+LedgerMaster::seqForConsensusHash(uint256 const& hash)
+{
+    if (hash.isZero())
+        return 0;
+
+    if (auto inbound = app_.getInboundLedgers().find(hash))
+    {
+        if (auto const header = inbound->getLedger())
+        {
+            if (header->info().seq != 0)
+                return header->info().seq;
+        }
+        if (inbound->getSeq() != 0)
+            return inbound->getSeq();
+    }
+
+    auto matchSkip = [&](std::shared_ptr<Ledger const> const& ref) {
+        if (!ref)
+            return std::uint32_t{0};
+        if (ref->info().hash == hash)
+            return ref->info().seq;
+        if (ref->info().seq > 1 && ref->info().parentHash == hash)
+            return ref->info().seq - 1;
+        return std::uint32_t{0};
+    };
+    if (auto const s = matchSkip(getValidatedLedger()))
+        return s;
+    if (auto const s = matchSkip(getClosedLedger()))
+        return s;
+    if (auto const pub = getPublishedLedger())
+    {
+        if (pub->info().hash == hash)
+            return pub->info().seq;
+        if (pub->info().seq > 1 && pub->info().parentHash == hash)
+            return pub->info().seq - 1;
+    }
+
+    {
+        auto const trusted = app_.getValidations().getTrustedForLedger(hash);
+        if (!trusted.empty() && trusted.front() &&
+            trusted.front()->isFieldPresent(sfLedgerSequence))
+        {
+            auto const s = trusted.front()->getFieldU32(sfLedgerSequence);
+            if (s != 0)
+                return s;
+        }
+    }
+    for (auto const& v : app_.getValidations().currentTrusted())
+    {
+        if (v && v->getLedgerHash() == hash &&
+            v->isFieldPresent(sfLedgerSequence))
+        {
+            auto const s = v->getFieldU32(sfLedgerSequence);
+            if (s != 0)
+                return s;
+        }
+    }
+
+    // SQL only when we have no inbound yet. checkoutDb is the write
+    // session; do not hit it every consensus timer once REPLAY is running.
+    if (!app_.getInboundLedgers().find(hash))
+    {
+        std::string sql =
+            "SELECT LedgerSeq FROM Ledgers WHERE LedgerHash='";
+        sql.append(to_string(hash));
+        sql.append("';");
+        boost::optional<std::uint32_t> seq;
+        auto db = app_.getLedgerDB().checkoutDb();
+        *db << sql, soci::into(seq);
+        if (db->got_data() && seq && *seq != 0)
+            return *seq;
+    }
+
+    return 0;
+}
+
+void
+LedgerMaster::ensureReplayInbound(uint256 const& hash, std::uint32_t seq)
+{
+    auto inbound = app_.getInboundLedgers().find(hash);
+    if (inbound && inbound->getReason() != InboundLedger::Reason::REPLAY)
+    {
+        JLOG(m_journal.warn())
+            << "Need consensus ledger " << hash
+            << " replay (header); drop non-REPLAY inbound";
+        app_.getInboundLedgers().erase(hash);
+        inbound = {};
+    }
+    if (!inbound)
+    {
+        JLOG(m_journal.warn())
+            << "Need consensus ledger " << hash << " replay (header) seq="
+            << seq;
+        app_.getInboundLedgers().acquire(
+            hash, seq, InboundLedger::Reason::REPLAY);
+    }
+}
+
+std::shared_ptr<Ledger const>
+LedgerMaster::replayHeader(uint256 const& hash)
+{
+    auto inbound = app_.getInboundLedgers().find(hash);
+    if (!inbound || inbound->getReason() != InboundLedger::Reason::REPLAY)
+        return {};
+    auto header = inbound->getLedger();
+    if (!header || header->info().seq == 0)
+        return {};
+    return header;
+}
+
+void
+LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
+{
+    if (hash.isZero())
+        return;
+    if (getLedgerByHash(hash))
+        return;
+    if (mConsensusAcquireJob.exchange(true))
+        return;
+    if (!app_.getJobQueue().addJob(
+            jtADVANCE,
+            "replayConsensusLedger",
+            [this, hash](Job&) {
+                acquireForConsensus(hash);
+                mConsensusAcquireJob.store(false);
+            },
+            app_.doJobCounter()))
+    {
+        mConsensusAcquireJob.store(false);
+    }
+}
+
+std::shared_ptr<Ledger const>
+LedgerMaster::acquireForConsensus(uint256 const& hash)
+{
+    if (hash.isZero())
+        return {};
+
+    if (auto have = getLedgerByHash(hash))
+        return have;
+
+    auto cur = hash;
+    auto curSeq = seqForConsensusHash(hash);
+    if (curSeq == 0)
+    {
+        ensureReplayInbound(hash, 0);
+        tryAdvance();
+        return {};
+    }
+
+    // Walk parentHash toward the local tip. Replay the oldest missing
+    // ledger whose parent is already local (typically valid+1).
+    constexpr int kMaxWalk = 256;
+    for (int step = 0; step < kMaxWalk; ++step)
+    {
+        if (auto have = getLedgerByHash(cur))
+        {
+            if (cur == hash)
+                return have;
+            break;
+        }
+
+        if (curSeq <= 1)
+        {
+            JLOG(m_journal.warn())
+                << "Skip consensus inbound " << hash << " seq=" << curSeq
+                << "; no parent, wait sequential replay";
+            tryAdvance();
+            return {};
+        }
+
+        auto header = replayHeader(cur);
+        if (!header)
+        {
+            ensureReplayInbound(cur, curSeq);
+            return {};
+        }
+        curSeq = header->info().seq;
+        auto const parentHash = header->info().parentHash;
+
+        if (getLedgerByHash(parentHash))
+        {
+            JLOG(m_journal.warn())
+                << "Need consensus ledger " << hash
+                << " replay chain at " << cur << " seq=" << curSeq;
+            tryReplayLedger(cur, curSeq);
+            return getLedgerByHash(hash);
+        }
+
+        JLOG(m_journal.warn())
+            << "Skip consensus inbound " << hash << " seq=" << curSeq
+            << "; walk parent " << parentHash;
+        cur = parentHash;
+        curSeq = curSeq - 1;
+    }
+
+    tryAdvance();
+    return getLedgerByHash(hash);
 }
 
 bool

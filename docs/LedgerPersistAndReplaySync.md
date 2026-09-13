@@ -131,6 +131,8 @@ FullBelow 以后只服务「回退 inbound」，可以保持 2 分钟，不再�
 - `jtLEDGER_DATA` 不必为了可用性再加并发（加并发容易和写盘打架）
 - `MAX_LEDGER_GAP = 100` 跳 published 先别动，避免 TableSync 以为连续
 
+**共识缺 LCL 仍走 `Reason::CONSENSUS` 整树，不在本阶段 0–2 范围内。** 专项方案见 [ConsensusLedgerReplay.md](ConsensusLedgerReplay.md)：三处 CONSENSUS acquire 改 `acquireForConsensus`，父本在则重放，父本不在则等顺序补块，禁止对 tip 整本拉取。
+
 ---
 
 ## 6. 方案对比

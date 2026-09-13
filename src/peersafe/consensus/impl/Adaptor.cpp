@@ -248,20 +248,10 @@ Adaptor::acquireLedger(LedgerHash const& hash)
     {
         if (acquiringLedger_ != hash)
         {
-            // need to start acquiring the correct consensus LCL
             JLOG(j_.warn()) << "Need consensus ledger " << hash;
-
-            // Tell the ledger acquire system that we need the consensus ledger
             acquiringLedger_ = hash;
-
-            app_.getJobQueue().addJob(
-                jtADVANCE,
-                "getConsensusLedger",
-                [id = hash, &app = app_](Job&) {
-                    app.getInboundLedgers().acquire(
-                        id, 0, InboundLedger::Reason::CONSENSUS);
-                }, app_.doJobCounter());
         }
+        ledgerMaster_.requestAcquireForConsensus(hash);
         return boost::none;
     }
 
