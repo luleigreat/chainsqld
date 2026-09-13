@@ -194,6 +194,20 @@ shouldAcquire(
     return ret;
 }
 
+// Peers advertise complete_ledgers as [firstseq, lastseq] on TMStatusChange.
+// If no connected peer claims a historical seq, inbound will only walk the
+// local tree and time out.
+static bool
+anyPeerHasLedgerSeq(Schema& app, std::uint32_t seq)
+{
+    bool found = false;
+    app.peerManager().foreach([&](std::shared_ptr<Peer> const& peer) {
+        if (peer && peer->hasRange(app.schemaId(), seq, seq))
+            found = true;
+    });
+    return found;
+}
+
 LedgerMaster::LedgerMaster(
     Schema& app,
     Stopwatch& stopwatch,
@@ -2395,6 +2409,14 @@ LedgerMaster::doAdvance(std::unique_lock<std::recursive_mutex>& sl)
                     }
                     else
                         missing = boost::none;
+                }
+                if (missing && reason == InboundLedger::Reason::HISTORY &&
+                    !anyPeerHasLedgerSeq(app_, *missing))
+                {
+                    JLOG(m_journal.info())
+                        << "Skip history acquire " << *missing
+                        << "; no peer complete_ledgers covers it";
+                    missing = boost::none;
                 }
                 if (!missing && mFillInProgress == 0)
                 {
