@@ -85,6 +85,9 @@ HotstuffConsensus::startRound(
     ConsensusMode startMode =
         proposing ? ConsensusMode::proposing : ConsensusMode::observing;
 
+    if (waitingForInit())
+        startMode = ConsensusMode::observing;
+
     // We were handed the wrong ledger
     if (prevLedger.id() != prevLedgerID)
     {
@@ -96,6 +99,7 @@ HotstuffConsensus::startRound(
         else  // Unable to acquire the correct ledger
         {
             startMode = ConsensusMode::wrongLedger;
+            adaptor_.onEnterWrongLedger();
             JLOG(j_.info())
                 << "Entering consensus with: " << previousLedger_.id();
             JLOG(j_.info()) << "Correct LCL is: " << prevLedgerID;
@@ -924,11 +928,12 @@ HotstuffConsensus::initAnnounce()
     initAnnounceTime_ = now_;
 
     JLOG(j_.info()) << "Init announce to other peers prevSeq="
-                    << previousLedger_.seq() << ", prevHash=" << prevLedgerID_;
+                    << previousLedger_.seq()
+                    << ", prevHash=" << previousLedger_.id();
 
     auto initAnnounce = std::make_shared<STInitAnnounce>(
         previousLedger_.seq(),
-        prevLedgerID_,
+        previousLedger_.id(),
         adaptor_.valPublic(),
         adaptor_.closeTime());
 
@@ -1509,6 +1514,7 @@ HotstuffConsensus::handleWrongLedger(typename Ledger_t::ID const& lgrId)
     }
 
     mode_.set(ConsensusMode::wrongLedger, adaptor_);
+    adaptor_.onEnterWrongLedger();
 
     return false;
 }

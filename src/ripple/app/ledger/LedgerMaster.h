@@ -44,6 +44,7 @@
 #include <peersafe/protocol/TableDefines.h>
 #include <peersafe/schema/Schema.h>
 
+#include <atomic>
 #include <mutex>
 #include <vector>
 
@@ -203,6 +204,21 @@ public:
     /** REPLAY (or header+tx) inbound finished; resume the consensus walk. */
     void
     onReplayInboundReady(uint256 const& hash);
+
+    /** True while acquireForConsensus still needs a missing network LCL. */
+    bool
+    consensusReplayPending() const;
+
+    /** Propose only when not mid-replay. OperatingMode FULL is not enough. */
+    bool
+    shouldProposeConsensus() const
+    {
+        return !consensusReplayPending();
+    }
+
+    /** Drop contract/account apply scratch used by replay and buildLCL. */
+    void
+    clearConsensusApplyCaches();
 
     boost::optional<NetClock::time_point>
     getCloseTimeBySeq(LedgerIndex ledgerIndex);
@@ -412,6 +428,10 @@ private:
     void
     clearConsensusWalk();
 
+    /** Drop apply caches while replay is still pending, then allow propose. */
+    void
+    finishConsensusReplay();
+
     void
     touchConsensusWalkPath();
 
@@ -535,7 +555,7 @@ private:
     uint256 mConsensusWalkTip;
     std::vector<uint256> mConsensusWalkPath;
     std::uint32_t mConsensusWalkSeq{0};
-    uint256 mConsensusReplayMismatch;
+    std::atomic_bool mConsensusReplayActive{false};
 
     // Publish thread has work to do.
     bool mAdvanceWork{false};

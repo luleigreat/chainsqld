@@ -277,6 +277,17 @@ PopAdaptor::doAccept(
     prevProposers_ = result.proposers;
     prevRoundTime_ = result.roundTime.read();
 
+    ledgerMaster_.setBuildingLedger(prevLedger.seq() + 1);
+
+    if (ledgerMaster_.consensusReplayPending())
+    {
+        JLOG(j_.warn())
+            << "Skip buildLCL; consensus replay in progress seq="
+            << prevLedger.seq() + 1;
+        ledgerMaster_.setBuildingLedger(0);
+        return;
+    }
+
     bool closeTimeCorrect;
 
     const bool proposing =

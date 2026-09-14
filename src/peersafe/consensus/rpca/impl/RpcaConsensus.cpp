@@ -215,6 +215,7 @@ RpcaConsensus::startRound(
         else  // Unable to acquire the correct ledger
         {
             startMode = ConsensusMode::wrongLedger;
+            adaptor_.onEnterWrongLedger();
             JLOG(j_.info())
                 << "Entering consensus with: " << previousLedger_.id();
             JLOG(j_.info()) << "Correct LCL is: " << prevLedgerID;
@@ -553,6 +554,7 @@ RpcaConsensus::handleWrongLedger(typename Ledger_t::ID const& lgrId)
     }
     else
     {
+        adaptor_.onEnterWrongLedger();
         mode_.set(ConsensusMode::wrongLedger, adaptor_);
     }
 }

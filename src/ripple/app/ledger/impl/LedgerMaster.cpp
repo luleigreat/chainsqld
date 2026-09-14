@@ -64,6 +64,8 @@
 #include <peersafe/protocol/STEntry.h>
 #include <peersafe/app/sql/TxStore.h>
 #include <peersafe/app/misc/TxPool.h>
+#include <peersafe/app/misc/ContractHelper.h>
+#include <peersafe/app/misc/StateManager.h>
 #include <peersafe/schema/Schema.h>
 #include <peersafe/schema/PeerManager.h>
 #include <peersafe/schema/SchemaManager.h>
@@ -494,6 +496,12 @@ LedgerMaster::replayFromHeaderTx(
     try
     {
         LedgerReplay replayData(parent, headerTx);
+        JLOG(m_journal.warn())
+            << "replayFromHeaderTx seq=" << headerTx->info().seq
+            << " parentSeq=" << parent->info().seq
+            << " parent=" << parent->info().hash
+            << " txs=" << replayData.orderedTxns().size()
+            << " expected=" << expectedHash;
         auto built = buildLedger(
             replayData,
             tapNO_CHECK_SIGN | tapForConsensus,
@@ -505,13 +513,13 @@ LedgerMaster::replayFromHeaderTx(
                 << "replayFromHeaderTx root mismatch seq="
                 << headerTx->info().seq << " built="
                 << (built ? to_string(built->info().hash) : "null")
-                << " expected=" << expectedHash;
-            mConsensusReplayMismatch = expectedHash;
+                << " expected=" << expectedHash
+                << " parentSeq=" << parent->info().seq
+                << " parent=" << parent->info().hash
+                << " txs=" << replayData.orderedTxns().size();
             return {};
         }
 
-        if (mConsensusReplayMismatch == expectedHash)
-            mConsensusReplayMismatch = uint256();
         persistValidated(built);
         JLOG(m_journal.warn())
             << "replayFromHeaderTx built " << built->info().seq << " "
@@ -538,9 +546,6 @@ std::shared_ptr<Ledger const>
 LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
 {
     if (hash.isZero() || seq <= 1)
-        return {};
-
-    if (hash == mConsensusReplayMismatch)
         return {};
 
     auto inbound = app_.getInboundLedgers().find(hash);
@@ -593,7 +598,7 @@ LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
     }
 
     auto built = replayFromHeaderTx(parent, headerTx, hash);
-    if (hash != mConsensusReplayMismatch)
+    if (built)
         app_.getInboundLedgers().erase(hash);
     return built;
 }
@@ -905,7 +910,11 @@ LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
         mConsensusRequested = hash;
     }
     if (getLedgerByHash(hash))
+    {
+        finishConsensusReplay();
         return;
+    }
+    mConsensusReplayActive.store(true);
     if (mConsensusAcquireJob.exchange(true))
         return;
     if (!app_.getJobQueue().addJob(
@@ -936,6 +945,29 @@ LedgerMaster::onReplayInboundReady(uint256 const& hash)
     requestAcquireForConsensus(req);
 }
 
+bool
+LedgerMaster::consensusReplayPending() const
+{
+    return mConsensusReplayActive.load();
+}
+
+void
+LedgerMaster::clearConsensusApplyCaches()
+{
+    app_.getContractHelper().clearCache();
+    app_.getStateManager().clear();
+}
+
+void
+LedgerMaster::finishConsensusReplay()
+{
+    // Keep pending true until caches are dropped so doAccept still skips
+    // buildLCL. Clearing first avoids wiping a concurrent apply.
+    if (mConsensusReplayActive.load())
+        clearConsensusApplyCaches();
+    mConsensusReplayActive.store(false);
+}
+
 std::shared_ptr<Ledger const>
 LedgerMaster::acquireForConsensus(uint256 const& hash)
 {
@@ -945,9 +977,12 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
     if (auto have = getLedgerByHash(hash))
     {
         clearConsensusWalk();
+        finishConsensusReplay();
         tryAdvance();
         return have;
     }
+
+    mConsensusReplayActive.store(true);
 
     joinConsensusWalk(hash);
 
@@ -966,6 +1001,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
     {
         if (auto have = getLedgerByHash(hash))
         {
+            finishConsensusReplay();
             tryAdvance();
             return have;
         }
@@ -1003,6 +1039,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
             if (cur == hash)
             {
                 clearConsensusWalk();
+                finishConsensusReplay();
                 tryAdvance();
                 checkUpdateOpenLedger();
                 return have;
@@ -1015,6 +1052,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
                 if (auto got = getLedgerByHash(hash))
                 {
                     clearConsensusWalk();
+                    finishConsensusReplay();
                     tryAdvance();
                     checkUpdateOpenLedger();
                     return got;
@@ -1047,8 +1085,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
         auto header = replayHeader(cur);
         if (!header)
         {
-            if (cur != mConsensusReplayMismatch)
-                ensureReplayInbound(cur, curSeq);
+            ensureReplayInbound(cur, curSeq);
             mConsensusWalkSeq = curSeq;
             tryAdvance();
             return {};
@@ -1070,11 +1107,6 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
 
         if (getLedgerByHash(parentHash))
         {
-            if (cur == mConsensusReplayMismatch)
-            {
-                touchConsensusWalkPath();
-                return getLedgerByHash(hash);
-            }
             JLOG(m_journal.warn())
                 << "Need consensus ledger " << hash
                 << " replay chain at " << cur << " seq=" << curSeq;
@@ -1091,6 +1123,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
             if (auto have = getLedgerByHash(hash))
             {
                 clearConsensusWalk();
+                finishConsensusReplay();
                 checkUpdateOpenLedger();
                 return have;
             }
@@ -2274,7 +2307,7 @@ LedgerMaster::findNewLedgersToPublish(
                     inbound &&
                     inbound->getReason() == InboundLedger::Reason::REPLAY &&
                     !inbound->isFailed();
-                if (!replayFetching && *hash != mConsensusReplayMismatch)
+                if (!replayFetching)
                     ledger = app_.getInboundLedgers().acquire(
                         *hash, seq, InboundLedger::Reason::GENERIC);
             }

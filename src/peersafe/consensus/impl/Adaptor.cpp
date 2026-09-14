@@ -98,7 +98,10 @@ Adaptor::preStartRound(
     if (validating_)
     {
         JLOG(j_.info()) << "Entering consensus process, validating, synced="
-                        << (synced ? "yes" : "no");
+                        << (synced ? "yes" : "no")
+                        << " replay="
+                        << (ledgerMaster_.consensusReplayPending() ? "yes"
+                                                                   : "no");
     }
     else
     {
@@ -116,7 +119,7 @@ Adaptor::preStartRound(
         nUnlVote_.newValidators(prevLgr.seq() + 1, nowTrusted);
 
     // propose only if we're in sync with the network (and validating)
-    return validating_ && synced;
+    return validating_ && synced && ledgerMaster_.shouldProposeConsensus();
 }
 
 void
@@ -344,6 +347,13 @@ Adaptor::onModeChange(ConsensusMode before, ConsensusMode after)
                         << ", after=" << to_string(after);
         mode_ = after;
     }
+}
+
+void
+Adaptor::onEnterWrongLedger()
+{
+    ledgerMaster_.setBuildingLedger(0);
+    ledgerMaster_.clearConsensusApplyCaches();
 }
 
 TrustChanges

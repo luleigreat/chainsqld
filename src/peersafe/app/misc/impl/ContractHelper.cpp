@@ -95,6 +95,7 @@ namespace ripple {
         if (bQuery)
             return boost::none;
 
+        std::lock_guard lock(mutex_);
         if (mDirtyCache.find(contract) != mDirtyCache.end())
         {
             if (mDirtyCache[contract].find(key) != mDirtyCache[contract].end())
@@ -117,6 +118,7 @@ namespace ripple {
         bool bQuery /*=false*/
     )
     {
+        std::lock_guard lock(mutex_);
         std::shared_ptr<SHAMap> mapPtr = nullptr;
         if (mShaMapCache.find(contract) == mShaMapCache.end() || bQuery)
         {
@@ -186,12 +188,14 @@ namespace ripple {
     void
     ContractHelper::clearDirty()
     {
+        std::lock_guard lock(mutex_);
 	    mDirtyCache.clear();
     }
 
     void
     ContractHelper::flushDirty(TER code)
     {
+        std::lock_guard lock(mutex_);
         if (code == TEScodes::tesSUCCESS)
         {
             auto it = mDirtyCache.begin();
@@ -207,14 +211,16 @@ namespace ripple {
             }
         }
         
-        clearDirty();
+        mDirtyCache.clear();
 	}
 
     void
     ContractHelper::clearCache()
     {
+        std::lock_guard lock(mutex_);
         mStateCache.clear();
         mShaMapCache.clear();
+        mDirtyCache.clear();
     }
 
     void ContractHelper::setStorage(
@@ -223,6 +229,7 @@ namespace ripple {
         uint256 const& key,
         uint256 const& value)
     {
+        std::lock_guard lock(mutex_);
         if (mDirtyCache.find(contract) != mDirtyCache.end() &&
             mDirtyCache[contract].find(key) != mDirtyCache[contract].end())
         {
@@ -275,6 +282,7 @@ namespace ripple {
     void
     ContractHelper::apply(OpenView& open)
     {
+        std::lock_guard lock(mutex_);
         if (mStateCache.empty())
             return;
         try

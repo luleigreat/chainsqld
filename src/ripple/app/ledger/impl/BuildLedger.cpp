@@ -287,6 +287,12 @@ buildLedger(
             }
             fail += static_cast<int>(pending.size());
             LedgerAdjust::updateTxCount(app, accum, success, fail);
+            if (fail)
+            {
+                JLOG(j.warn())
+                    << "Replay apply seq=" << replayLedger->info().seq
+                    << " success=" << success << " fail=" << fail;
+            }
         });
 }
 

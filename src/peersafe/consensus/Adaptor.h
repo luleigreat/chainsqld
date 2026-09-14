@@ -418,6 +418,10 @@ public:
     void
     onModeChange(ConsensusMode before, ConsensusMode after);
 
+    /** Stop proposing and drop apply caches before consensus replay. */
+    void
+    onEnterWrongLedger();
+
     virtual TrustChanges
     onConsensusReached(
         bool waitingConsensusReach,

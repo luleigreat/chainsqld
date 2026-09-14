@@ -53,6 +53,10 @@ PopConsensus::startRound(
     ConsensusMode startMode =
         proposing ? ConsensusMode::proposing : ConsensusMode::observing;
 
+    // Restart / catch-up: do not propose until init handshake and LCL match.
+    if (waitingForInit())
+        startMode = ConsensusMode::observing;
+
     // We were handed the wrong ledger
     if (prevLedger.id() != prevLedgerID)
     {
@@ -64,6 +68,7 @@ PopConsensus::startRound(
         else  // Unable to acquire the correct ledger
         {
             startMode = ConsensusMode::wrongLedger;
+            adaptor_.onEnterWrongLedger();
             JLOG(j_.info())
                 << "Entering consensus with: " << previousLedger_.id();
             JLOG(j_.info()) << "Correct LCL is: " << prevLedgerID;
@@ -86,7 +91,25 @@ PopConsensus::timerEntry(NetClock::time_point const& now)
     {
         consensusTime_ = utcTime();
 
-        if (adaptor_.validating() && mode_.get() != ConsensusMode::wrongLedger)
+        if (mode_.get() == ConsensusMode::wrongLedger)
+        {
+            if (auto newLedger = adaptor_.acquireLedger(prevLedgerID_))
+            {
+                JLOG(j_.warn())
+                    << "Have the consensus ledger " << newLedger->seq()
+                    << ":" << prevLedgerID_;
+                adaptor_.removePoolTxs(
+                    newLedger->ledger_->txMap(),
+                    newLedger->ledger_->info().seq,
+                    newLedger->ledger_->info().parentHash);
+                startRoundInternal(
+                    now_,
+                    prevLedgerID_,
+                    *newLedger,
+                    ConsensusMode::switchedLedger);
+            }
+        }
+        else if (adaptor_.validating())
         {
             initAnnounce();
         }
@@ -478,11 +501,12 @@ PopConsensus::initAnnounce()
     initAnnounceTime_ = now_;
 
     JLOG(j_.info()) << "Init announce to other peers prevSeq="
-                    << previousLedger_.seq() << ", prevHash=" << prevLedgerID_;
+                    << previousLedger_.seq()
+                    << ", prevHash=" << previousLedger_.id();
 
     auto initAnnounce = std::make_shared<STInitAnnounce>(
         previousLedger_.seq(),
-        prevLedgerID_,
+        previousLedger_.id(),
         adaptor_.valPublic(),
         adaptor_.closeTime());
 
@@ -520,6 +544,10 @@ PopConsensus::startRoundInternal(
     prevLedgerID_ = prevLedgerID;
     prevLedgerSeq_ = prevLedger.seq();
     previousLedger_ = prevLedger;
+    if (mode != ConsensusMode::wrongLedger)
+        adaptor_.app_.getLedgerMaster().setBuildingLedger(prevLedger.seq() + 1);
+    else
+        adaptor_.app_.getLedgerMaster().setBuildingLedger(0);
     result_.reset();
     acquired_.clear();
     rawCloseTimes_.peers.clear();
@@ -609,6 +637,7 @@ PopConsensus::handleWrongLedger(typename Ledger_t::ID const& lgrId)
     }
     else
     {
+        adaptor_.onEnterWrongLedger();
         mode_.set(ConsensusMode::wrongLedger, adaptor_);
     }
 }
@@ -673,6 +702,14 @@ PopConsensus::phaseCollecting()
     // Decide if we should propose a tx-set
     if (adaptor_.isLeader(previousLedger_.seq() + 1, view_) && !result_)
     {
+        if (!adaptor_.app_.getLedgerMaster().shouldProposeConsensus())
+        {
+            JLOG(j_.warn())
+                << "Skip leader propose; consensus replay in progress seq="
+                << previousLedger_.seq() + 1;
+            return;
+        }
+
         if (!adaptor_.isPoolAvailable())
         {
             return;
@@ -875,7 +912,9 @@ PopConsensus::checkTimeout()
                         << viewChangeManager_.getJson().toStyledString();
     }
 
-    if (adaptor_.validating())
+    if (adaptor_.validating() &&
+        mode_.get() != ConsensusMode::wrongLedger &&
+        !adaptor_.app_.getLedgerMaster().consensusReplayPending())
         launchViewChange();
 
     timeOutCount_++;
@@ -1449,10 +1488,9 @@ PopConsensus::peerInitAnnounceInternal(STInitAnnounce::ref initAnnounce)
             JLOG(j_.warn())
                 << "Init time switch to netLedger " << initAnnounce->prevSeq()
                 << ":" << initAnnounce->prevHash();
-            prevLedgerID_ = initAnnounce->prevHash();
+            handleWrongLedger(initAnnounce->prevHash());
             prevLedgerSeq_ = initAnnounce->prevSeq();
             initAcquireLedgerID_ = prevLedgerID_;
-            //checkLedger();
         }
         else if (initAnnounce->prevHash() == prevLedgerID_)
         {

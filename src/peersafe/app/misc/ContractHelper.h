@@ -1,6 +1,7 @@
 #ifndef __H_CHAINSQL_CONTRACT_HELPER_H__
 #define __H_CHAINSQL_CONTRACT_HELPER_H__
 
+#include <mutex>
 #include <vector>
 #include <boost/bind.hpp>
 #include <ripple/protocol/STTx.h>
@@ -93,6 +94,7 @@ private:
 											mRecordCache;
 
 	//LedgerIndex						mCurSeq;
+    std::recursive_mutex            mutex_;
     std::map<AccountID, map256>     mDirtyCache;
     std::map<AccountID, map256>     mStateCache;
     std::map<AccountID, std::shared_ptr<SHAMap>> mShaMapCache;

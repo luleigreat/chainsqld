@@ -112,7 +112,8 @@ getLedgerByHash(hash)
   已 complete 的 GENERIC 整本：storeLedger 使用，**不要 erase**
   未拿到 header+tx 的 GENERIC/CONSENSUS：erase 改 REPLAY
   重放 apply 与共识对齐：retry pass + LedgerAdjust::updateTxCount
-  同一 hash root mismatch 只打一次，不再 erase 拉头重试
+  root mismatch 只打日志并结束本 job，下轮可再试（禁止永久拉黑）；成功才 erase inbound
+  落后 tip 时 `shouldProposeConsensus()==false`，禁止 proposing / `buildLCL` 错 child
   重放成功只 `persistValidated`（valid）。closed/open 一起动：`checkUpdateOpenLedger` 里先 `switchLCL(valid)` 再重建 open=valid+1，保证 `open.parentHash == closed.hash`
   parent 不在 → 当前 = parentHash，push 进 path，继续走
 
@@ -155,7 +156,7 @@ getLedgerByHash(hash)
 |---|---|---|
 | 父本不在 | 沿 parentHash 往回 REPLAY，先重放离本地最近的一本 | 对 tip CONSENSUS；只靠 pub+1…valid |
 | REPLAY 超时 / fail | 擦掉该 inbound，下轮再 REPLAY；连续失败再考虑回退 | 第一次失败就整本 tip |
-| Root 不对 | 日志 + 不 persist；记下 hash，不再拉头重放，也不升 GENERIC | 把 headerTx 当完整账本 `doValid`；200ms 死循环重试 |
+| Root 不对 | 日志 + 不 persist；本 job 结束，下轮可再试（parent/cache 清了可能过）；不升 GENERIC | 把 headerTx 当完整账本 `doValid`；永久拉黑该 hash；200ms 死循环重试 |
 | `SHAMapMissingNode` | 按 hash 补该节点后重试该本（阶段 1 语义） | `acquire(当前 tip, CONSENSUS)` |
 | 本地无任何可执行状态 | **一次** 整本（冷启动） | 之后每轮再开整本 |
 | REPLAY 进行中 | 等 | `acquire` 升级为 CONSENSUS（`InboundLedgers` 已拒绝把 REPLAY 结果交给 CONSENSUS，但不要并存两种 reason） |
@@ -206,6 +207,11 @@ getLedgerByHash(hash)
 13. **每个 job 只重放一本就 return，且 REPLAY 完成不续跑** → 追上 tip 附近后只拉新 tip header，最后几本永远不重放。必须 job 内连续重放 + inbound 完成回调 + 预算自挂。
 14. **只推 valid、不切 closed，或只切 closed 不改 open** → `beginConsensus` 假定 `open.parentHash == closed.hash`。必须在 `checkUpdateOpenLedger` 里两者一起动：先 `switchLCL(valid)`，再重建 open。
 15. **`RpcaPopAdaptor::checkLedgerAccept` 对 tip 开 GENERIC** → 每个新 tip `drop non-REPLAY`，和重放抢 inbound。改走 `requestAcquireForConsensus`。
+16. **追上（或还在 replay）就 `proposing` / `doAccept`** → 本机先 `buildLCL` 出错 child，再 replay 同一 seq；`ContractHelper` 无锁，`jtACCEPT` 与 `jtADVANCE` 并发 `flushDirty`/`clearCache` 会把 `std::map` 写崩。落后 tip 时只 observing/wrongLedger；`preStartRound` 看 `shouldProposeConsensus()`；init 窗口不 propose；`InitAnnounce` 只用本地 `previousLedger_.id()`；切到网络 LCL 立刻 `handleWrongLedger`。
+17. **`mConsensusReplayMismatch` 永久拉黑** → 同一 hash 换 parent / 清缓存后能过，却再也追不上。mismatch 只记日志并结束本 job，下轮重试。
+18. **validation 先到、本机还在 `buildLCL`** → `checkLedgerAccept` 又开 REPLAY。`startRoundInternal` / `doAccept` 开头 `setBuildingLedger(seq+1)`，validation 对正在 build 的 seq 只等本地结果。
+
+`ContractHelper` 的 dirty/state/SHAMap cache 用一把 `recursive_mutex` 罩住 `flushDirty` / `clearCache` / `setStorage` / `apply`。进入 wrongLedger 和 replay 追上 tip 时 `clearConsensusApplyCaches()`。
 
 ---
 
@@ -234,6 +240,9 @@ getLedgerByHash(hash)
 - 新库冷启动：允许一次整本，日志标明 `cold-inbound`；之后落后走重放。
 - 1 验证 + 3 tracking：watching 不崩、不造空 `valPublic`。
 - TableSync / 订阅：published 连续，不因共识重放跳号。
+- 落后期间：`Entering consensus` 应 `replay=yes`，不得 `proposing`；可见 `Skip buildLCL`，不应再 `flushDirty` 红黑树崩溃。
+- mismatch 后下轮可再 `replayFromHeaderTx`；日志含 parentSeq/parent/txs；`fail>0` 打 `Replay apply seq=… success=… fail=…`。
+- InitAnnounce：`prevSeq` 与 `prevHash` 必须同属本地 `previousLedger_`，禁止本地 seq 配网络 tip hash。
 - 回滚：恢复三处 CONSENSUS acquire，阶段 0–2 行为不变。
 
 ---
