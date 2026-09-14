@@ -111,7 +111,7 @@ public:
 
     // The validated ledger is the last fully validated ledger
     inline LedgerIndex
-    getValidLedgerIndex()
+    getValidLedgerIndex() const
     {
         return mValidLedgerSeq.load();
     }
