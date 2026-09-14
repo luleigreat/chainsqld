@@ -544,10 +544,6 @@ PopConsensus::startRoundInternal(
     prevLedgerID_ = prevLedgerID;
     prevLedgerSeq_ = prevLedger.seq();
     previousLedger_ = prevLedger;
-    if (mode != ConsensusMode::wrongLedger)
-        adaptor_.app_.getLedgerMaster().setBuildingLedger(prevLedger.seq() + 1);
-    else
-        adaptor_.app_.getLedgerMaster().setBuildingLedger(0);
     result_.reset();
     acquired_.clear();
     rawCloseTimes_.peers.clear();
@@ -705,14 +701,9 @@ PopConsensus::phaseCollecting()
         auto& lm = adaptor_.app_.getLedgerMaster();
         if (!lm.shouldProposeConsensus())
         {
-            char const* why = "not ready";
-            if (lm.consensusReplayPending())
-                why = "consensus replay in progress";
-            else if (
-                lm.getValidLedgerIndex() < lm.consensusProposeAfterSeq())
-                why = "settling after catch-up";
-            JLOG(j_.debug()) << "Skip leader propose; " << why
-                             << " seq=" << previousLedger_.seq() + 1;
+            JLOG(j_.debug())
+                << "Skip leader propose; consensus replay in progress seq="
+                << previousLedger_.seq() + 1;
             return;
         }
 

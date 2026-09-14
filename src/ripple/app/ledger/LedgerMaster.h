@@ -99,7 +99,7 @@ public:
     }
 
     inline LedgerIndex
-    getBuildingLedger()
+    getBuildingLedger() const
     {
         return mBuildingLedgerSeq.load();
     }
@@ -209,15 +209,21 @@ public:
     bool
     consensusReplayPending() const;
 
-    /** Propose when not mid-replay and past the post-catch-up settle seq. */
+    /** Propose when consensus replay is not still filling in the LCL. */
     bool
     shouldProposeConsensus() const;
 
-    LedgerIndex
-    consensusProposeAfterSeq() const
-    {
-        return mConsensusProposeAfterSeq.load();
-    }
+    /** False while buildLCL is applying this seq (unknown seq counts as applying). */
+    bool
+    shouldAcquireForConsensus(uint256 const& hash, std::uint32_t seq) const;
+
+    /** Trusted validation hash with >= quorum at seq, if any. */
+    boost::optional<uint256>
+    quorumHashForSeq(LedgerIndex seq);
+
+    /** Drop seq→hash closed index for a local build the network did not take. */
+    void
+    discardUnvalidatedClosed(LedgerIndex seq, uint256 const& localHash);
 
     /** Drop contract/account apply scratch used by replay and buildLCL. */
     void
@@ -572,7 +578,6 @@ private:
     std::vector<uint256> mConsensusWalkPath;
     std::uint32_t mConsensusWalkSeq{0};
     std::atomic_bool mConsensusReplayActive{false};
-    std::atomic<LedgerIndex> mConsensusProposeAfterSeq{0};
     std::uint32_t mWrongChainDropSeq{0};
 
     // Publish thread has work to do.

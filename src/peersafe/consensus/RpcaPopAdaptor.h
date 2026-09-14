@@ -124,6 +124,16 @@ protected:
         uint256 const& consensusHash,
         Json::Value consensus);
 
+    /** If seq already has a quorum hash, switch to it or acquire it.
+        Clears building. Returns true if doAccept should skip buildLCL. */
+    bool
+    acceptQuorumLedger(LedgerIndex seq);
+
+    /** After local build: if quorum picked a different hash, drop local
+        closed index and acquire network. Skip switchLCL when true. */
+    bool
+    discardLocalIfQuorumDiffers(RCLCxLedger const& built);
+
 private:
     /** Accept a new ledger based on the given transactions.
 

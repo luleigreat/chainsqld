@@ -18,6 +18,7 @@
 //==============================================================================
 
 #include <ripple/app/consensus/RCLValidations.h>
+#include <ripple/protocol/STValidation.h>
 #include <ripple/app/ledger/Ledger.h>
 #include <ripple/app/ledger/LedgerMaster.h>
 #include <ripple/app/ledger/TransactionMaster.h>
@@ -43,6 +44,7 @@
 #include <ripple/basics/Log.h>
 #include <ripple/basics/MathUtilities.h>
 #include <ripple/basics/TaggedCache.h>
+#include <ripple/basics/UnorderedContainers.h>
 #include <ripple/basics/UptimeClock.h>
 #include <ripple/basics/contract.h>
 #include <ripple/basics/safe_cast.h>
@@ -1041,6 +1043,17 @@ LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
 {
     if (hash.isZero())
         return;
+    if (!getLedgerByHash(hash))
+    {
+        auto const seq = seqForConsensusHash(hash);
+        if (!shouldAcquireForConsensus(hash, seq))
+        {
+            JLOG(m_journal.debug())
+                << "Defer consensus acquire " << hash << " seq=" << seq
+                << " building=" << getBuildingLedger();
+            return;
+        }
+    }
     {
         std::lock_guard lock(mConsensusRequestMutex);
         mConsensusRequested = hash;
@@ -1090,11 +1103,72 @@ LedgerMaster::consensusReplayPending() const
 bool
 LedgerMaster::shouldProposeConsensus() const
 {
-    if (consensusReplayPending())
-        return false;
-    if (getValidLedgerIndex() < mConsensusProposeAfterSeq.load())
+    return !consensusReplayPending();
+}
+
+bool
+LedgerMaster::shouldAcquireForConsensus(
+    uint256 const& hash,
+    std::uint32_t seq) const
+{
+    (void)hash;
+    auto const building = getBuildingLedger();
+    if (building == 0)
+        return true;
+    if (seq == 0 || seq == building)
         return false;
     return true;
+}
+
+boost::optional<uint256>
+LedgerMaster::quorumHashForSeq(LedgerIndex seq)
+{
+    if (seq == 0)
+        return boost::none;
+    hash_map<uint256, std::size_t> counts;
+    auto const vals = app_.validators().negativeUNLFilter(
+        app_.getValidations().currentTrusted());
+    for (auto const& v : vals)
+    {
+        if (!v || !v->isFieldPresent(sfLedgerSequence))
+            continue;
+        if (v->getFieldU32(sfLedgerSequence) != seq)
+            continue;
+        ++counts[v->getLedgerHash()];
+    }
+    auto const q = app_.validators().quorum();
+    if (q == 0)
+        return boost::none;
+    boost::optional<uint256> found;
+    std::size_t best = 0;
+    for (auto const& item : counts)
+    {
+        if (item.second >= q && item.second > best)
+        {
+            best = item.second;
+            found = item.first;
+        }
+    }
+    return found;
+}
+
+void
+LedgerMaster::discardUnvalidatedClosed(
+    LedgerIndex seq,
+    uint256 const& localHash)
+{
+    if (seq <= 1 || localHash.isZero())
+        return;
+    auto const validated = mLedgerHistory.getLedgerHash(seq);
+    if (validated.isNonZero() && validated != localHash)
+        return;
+    if (mLedgerHistory.getClosedLedgerHash(seq) != localHash &&
+        validated != localHash)
+        return;
+    if (validated == localHash)
+        dropLedgerSeq(seq);
+    else
+        mLedgerHistory.dropIndex(seq);
 }
 
 void
@@ -1113,18 +1187,6 @@ LedgerMaster::finishConsensusReplay()
     if (wasReplay)
         clearConsensusApplyCaches();
     mConsensusReplayActive.store(false);
-    if (wasReplay)
-    {
-        // Follow a few network ledgers before proposing so gossip can refill
-        // the pool. Prevents packing a 2-tx set while others still have 6.
-        constexpr LedgerIndex kProposeSettleLedgers = 3;
-        auto const seq = getValidLedgerIndex();
-        auto const until = seq + kProposeSettleLedgers;
-        mConsensusProposeAfterSeq.store(until);
-        JLOG(m_journal.warn())
-            << "Propose after catch-up settle until seq=" << until
-            << " valid=" << seq;
-    }
 }
 
 std::shared_ptr<Ledger const>

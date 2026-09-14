@@ -207,15 +207,15 @@ getLedgerByHash(hash)
 13. **每个 job 只重放一本就 return，且 REPLAY 完成不续跑** → 追上 tip 附近后只拉新 tip header，最后几本永远不重放。必须 job 内连续重放 + inbound 完成回调 + 预算自挂。
 14. **只推 valid、不切 closed，或只切 closed 不改 open** → `beginConsensus` 假定 `open.parentHash == closed.hash`。必须在 `checkUpdateOpenLedger` 里两者一起动：先 `switchLCL(valid)`，再重建 open。
 15. **`RpcaPopAdaptor::checkLedgerAccept` 对 tip 开 GENERIC** → 每个新 tip `drop non-REPLAY`，和重放抢 inbound。改走 `requestAcquireForConsensus`。
-16. **追上（或还在 replay）就 `proposing` / `doAccept`** → 本机先 `buildLCL` 出错 child，再 replay 同一 seq；`ContractHelper` 无锁，`jtACCEPT` 与 `jtADVANCE` 并发 `flushDirty`/`clearCache` 会把 `std::map` 写崩。落后 tip 时只 observing/wrongLedger；`preStartRound` 看 `shouldProposeConsensus()`；init 窗口不 propose；`InitAnnounce` 只用本地 `previousLedger_.id()`；切到网络 LCL 立刻 `handleWrongLedger`。
+16. **追上（或还在 replay）就 `proposing` / `doAccept`** → 本机先 `buildLCL` 出错 child，再 replay 同一 seq；`ContractHelper` 无锁，`jtACCEPT` 与 `jtADVANCE` 并发 `flushDirty`/`clearCache` 会把 `std::map` 写崩。落后 tip 时只 observing/wrongLedger；`preStartRound` 看 `shouldProposeConsensus()`（仅 `!replay`）；init 窗口不 propose；`InitAnnounce` 只用本地 `previousLedger_.id()`；切到网络 LCL 立刻 `handleWrongLedger`。
 17. **`mConsensusReplayMismatch` 永久拉黑** → 同一 hash 换 parent / 清缓存后能过，却再也追不上。mismatch 只记日志并结束本 job，下轮重试。
-18. **validation 先到、本机还在 `buildLCL`** → `checkLedgerAccept` 又开 REPLAY。`startRoundInternal` / `doAccept` 开头 `setBuildingLedger(seq+1)`，validation 对正在 build 的 seq 只等本地结果。
-19. **追上立刻 `proposing`，池子未齐就当 leader** → 本机用 2 笔先 `switchLCL`，别人用 6 笔关同一 seq。replay 结束后 observe 3 本（`Propose after catch-up settle until seq=`）。空闲空池仍走原来的 `omitEMPTY`（提空集立刻 ViewChange），不要为了空池去等 `consensusTIMEOUT`。
-20. **`walk wrong-chain` 只停不修** → 错的 3711 写进 SQL，重启仍卡。检测到本机 tip 与网络 parent/hash 不一致时：丢掉该 seq、valid/closed 回到 parent、按网络 hash replay。`tryReplayLedger` 不得用 hash 对不上的 `getLedgerBySeq(seq-1)` 当父本。
+18. **validation 先到、本机还在 `buildLCL`** → `jtACCEPT` 与 `jtADVANCE` 双 apply，同一 tx-set `account_hash` 对不齐（4232）。`setBuildingLedger` **只在真正 `buildLCL` 时**置位，不得在 `startRound` / `onClose` / `onCollectFinish` 提前挂整轮。`requestAcquireForConsensus` / `checkLedgerAccept(hash,seq)` 对 `seq==building`（或 seq 未知）defer；`RCLValidations::acquire` 走同一入口。
+19. **本地票够了就 `switchLCL` 私有 child（3711）** → `MovedOn` 禁止用本地 `result_` `buildLCL`；该 seq 已有 quorum hash H 则 `Skip buildLCL; use/acquire quorum ledger`，禁止再算一遍。`buildLCL` 之后若 H 已是另一 hash：`Discard local buildLCL`，丢掉 closed 索引，清 apply 缓存，replay H。不要用 `validSeq+3` settle 挡 propose（空链 seq 不涨会一直 abnormal）。空闲空池仍走 `omitEMPTY`。
+20. **`walk wrong-chain` 只停不修** → 错的 3711 写进 SQL，重启仍卡。检测到本机 tip 与网络 parent/hash 不一致时：丢掉该 seq、valid/closed 回到 parent、按网络 hash replay。`tryReplayLedger` 不得用 hash 对不上的 `getLedgerBySeq(seq-1)` 当父本。这是 C/D 漏掉时的后盾，不是唯一防线。
 
 `ContractHelper` 的 dirty/state/SHAMap cache 用一把 `recursive_mutex` 罩住 `flushDirty` / `clearCache` / `setStorage` / `apply`。进入 wrongLedger 和 replay 追上 tip 时 `clearConsensusApplyCaches()`。
-catch-up 结束：`finishConsensusReplay` 先清缓存，再 `mConsensusReplayActive=false`，再设 `mConsensusProposeAfterSeq`。wrong-chain 回收期间保持 replay pending，禁止 `buildLCL`。
-`shouldProposeConsensus()` = `!replay && validSeq >= proposeAfterSeq`。`preStartRound` 和 POP `phaseCollecting` 都看它。
+catch-up 结束：`finishConsensusReplay` 先清缓存，再 `mConsensusReplayActive=false`。wrong-chain 回收期间保持 replay pending，禁止 `buildLCL`。
+`shouldProposeConsensus()` = `!consensusReplayPending()`。`preStartRound` 和 POP `phaseCollecting` 都看它。
 
 ---
 
@@ -247,8 +247,9 @@ catch-up 结束：`finishConsensusReplay` 先清缓存，再 `mConsensusReplayAc
 - 落后期间：`Entering consensus` 应 `replay=yes`，不得 `proposing`；可见 `Skip buildLCL`，不应再 `flushDirty` 红黑树崩溃。
 - mismatch 后下轮可再 `replayFromHeaderTx`；日志含 parentSeq/parent/txs；`fail>0` 打 `Replay apply seq=… success=… fail=…`。
 - InitAnnounce：`prevSeq` 与 `prevHash` 必须同属本地 `previousLedger_`，禁止本地 seq 配网络 tip hash。
-- 追上后：`Propose after catch-up settle until seq=`，settle 内不得当 leader。空闲空池仍可 `Empty transaction-set from self` 走 omitEMPTY。
-- 本机 3711 与网络 tx 数/hash 不同：应出现 `drop wrong-chain` + `rewind=` + `replayFromHeaderTx built` 网络那本；不应再刷 `walk wrong-chain` 停死。重启后同样能回收。
+- 追上后：replay 一结束即可 propose；不得再出现 `Propose after catch-up settle until seq=`。空闲空池仍可 `Empty transaction-set from self` 走 omitEMPTY，`server_status` 能进 `normal`。
+- 本机 3711 与网络 tx 数/hash 不同：应出现 `Skip buildLCL; use/acquire quorum ledger` 或 `Discard local buildLCL` / `MovedOn acquire`，不得 `switchLCL` 2 笔那本；SQL 该 seq 不是私有 child。后盾仍是 `drop wrong-chain` + `rewind=` + `replayFromHeaderTx built`。
+- 同一 tx-set 不得再 `LedgerHistory MISMATCH` 且 `account_hash` 不同（4232）：build 期间 `Defer consensus acquire`。
 - 回滚：恢复三处 CONSENSUS acquire，阶段 0–2 行为不变。
 
 ---

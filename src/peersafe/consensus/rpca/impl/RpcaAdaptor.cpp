@@ -121,9 +121,6 @@ RpcaAdaptor::onClose(
 
     auto const& prevLedger = ledger.ledger_;
 
-    // Tell the ledger master not to acquire the ledger we're probably building
-    ledgerMaster_.setBuildingLedger(prevLedger->info().seq + 1);
-
     auto initialLedger = app_.openLedger().current();
 
     auto initialSet = std::make_shared<SHAMap>(
@@ -230,13 +227,36 @@ RpcaAdaptor::doAccept(
         return;
     }
 
+    auto const seq = prevLedger.seq() + 1;
+    if (acceptQuorumLedger(seq))
+        return;
+
+    const bool consensusFail = result.state == ConsensusState::MovedOn;
+    if (consensusFail)
+    {
+        ledgerMaster_.setBuildingLedger(0);
+        auto const net = getPrevLedger(prevLedger.id(), prevLedger, mode);
+        if (net.isNonZero() && net != prevLedger.id())
+        {
+            JLOG(j_.warn()) << "Skip buildLCL; MovedOn acquire " << net
+                            << " seq=" << seq;
+            ledgerMaster_.requestAcquireForConsensus(net);
+        }
+        else
+        {
+            JLOG(j_.warn())
+                << "Skip buildLCL; MovedOn without network ledger seq="
+                << seq;
+        }
+        return;
+    }
+
     bool closeTimeCorrect;
 
     const bool proposing =
         (mode == ConsensusMode::proposing ||
          mode == ConsensusMode::switchedLedger);
     const bool haveCorrectLCL = mode != ConsensusMode::wrongLedger;
-    const bool consensusFail = result.state == ConsensusState::MovedOn;
 
     auto consensusCloseTime = result.position.closeTime();
 
@@ -300,6 +320,9 @@ RpcaAdaptor::doAccept(
         failed);
     JLOG(j_.info()) << "buildLCL time used:" << utcTime() - timeStart << "ms";
     timeStart = utcTime();
+
+    if (discardLocalIfQuorumDiffers(built))
+        return;
 
     auto const newLCLHash = built.id();
     JLOG(j_.debug()) << "Built ledger #" << built.seq() << ": " << newLCLHash;

@@ -272,6 +272,9 @@ RCLValidationsAdaptor::acquire(LedgerHash const& hash)
     {
         JLOG(j_.debug())
             << "Need validated ledger for preferred ledger analysis " << hash;
+        // requestAcquireForConsensus defers seq==building so it cannot
+        // race doAccept's buildLCL (4232). Competing quorum hashes are
+        // taken in doAccept after the apply finishes (3711).
         app_.getLedgerMaster().requestAcquireForConsensus(hash);
         return boost::none;
     }

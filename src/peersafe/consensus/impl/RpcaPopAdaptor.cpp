@@ -18,13 +18,17 @@
 //==============================================================================
 
 #include <ripple/app/ledger/LocalTxs.h>
+#include <ripple/app/ledger/OpenLedger.h>
 #include <ripple/app/ledger/TransactionMaster.h>
 #include <ripple/app/misc/AmendmentTable.h>
 #include <ripple/app/misc/HashRouter.h>
 #include <ripple/app/misc/LoadFeeTrack.h>
 #include <ripple/app/misc/NetworkOPs.h>
 #include <ripple/app/misc/Transaction.h>
+#include <ripple/app/misc/TxQ.h>
 #include <ripple/app/misc/ValidatorKeys.h>
+#include <ripple/ledger/OpenView.h>
+#include <ripple/protocol/TxFlags.h>
 #include <ripple/protocol/Feature.h>
 #include <ripple/protocol/digest.h>
 #include <peersafe/schema/PeerManager.h>
@@ -111,6 +115,79 @@ RpcaPopAdaptor::checkLedgerAccept(LedgerInfo const& info)
                     << " with >= " << minVal << " validations";
 
     return ledger;
+}
+
+bool
+RpcaPopAdaptor::acceptQuorumLedger(LedgerIndex seq)
+{
+    if (app_.config().standalone() || seq == 0)
+        return false;
+
+    auto const net = ledgerMaster_.quorumHashForSeq(seq);
+    if (!net)
+        return false;
+
+    ledgerMaster_.setBuildingLedger(0);
+
+    if (auto ledger = ledgerMaster_.getLedgerByHash(*net))
+    {
+        JLOG(j_.warn()) << "Skip buildLCL; use quorum ledger seq=" << seq
+                        << " " << *net;
+        // Same as doAccept / handleWrongLedger: drop on-chain txs from the
+        // pool before doValid advances valid (updateAvoid no-ops after that).
+        updatePoolAvoid(ledger->txMap(), ledger->seq());
+        removePoolTxs(
+            ledger->txMap(), ledger->seq(), ledger->info().parentHash);
+        auto const lastVal = ledgerMaster_.getValidatedLedger();
+        boost::optional<Rules> rules;
+        if (lastVal)
+            rules.emplace(*lastVal, app_.config().features);
+        else
+            rules.emplace(app_.config().features);
+        CanonicalTXSet retriableTxs{beast::zero};
+        app_.openLedger().accept(
+            app_,
+            *rules,
+            ledger,
+            localTxs_.getTxSet(),
+            false,
+            retriableTxs,
+            tapNONE,
+            "consensus",
+            [&](OpenView& view, beast::Journal j) {
+                return app_.getTxQ().accept(app_, view);
+            });
+        app_.getOPs().reportFeeChange();
+        ledgerMaster_.switchLCL(ledger);
+        if (checkLedgerAccept(ledger->info()))
+            doValidLedger(ledger);
+        ledgerMaster_.updateConsensusTime();
+        return true;
+    }
+
+    JLOG(j_.warn()) << "Skip buildLCL; acquire quorum ledger seq=" << seq
+                    << " " << *net;
+    ledgerMaster_.requestAcquireForConsensus(*net);
+    return true;
+}
+
+bool
+RpcaPopAdaptor::discardLocalIfQuorumDiffers(RCLCxLedger const& built)
+{
+    if (app_.config().standalone())
+        return false;
+
+    auto const net = ledgerMaster_.quorumHashForSeq(built.seq());
+    if (!net || *net == built.id())
+        return false;
+
+    JLOG(j_.warn()) << "Discard local buildLCL seq=" << built.seq()
+                    << " local=" << built.id() << " network=" << *net;
+    ledgerMaster_.setBuildingLedger(0);
+    ledgerMaster_.discardUnvalidatedClosed(built.seq(), built.id());
+    ledgerMaster_.clearConsensusApplyCaches();
+    ledgerMaster_.requestAcquireForConsensus(*net);
+    return true;
 }
 
 void
@@ -539,7 +616,7 @@ RpcaPopAdaptor::checkLedgerAccept(uint256 const& hash, std::uint32_t seq)
             return {nullptr, false};
 
         // Ledger could match the ledger we're already building
-        if (seq == ledgerMaster_.getBuildingLedger())
+        if (!ledgerMaster_.shouldAcquireForConsensus(hash, seq))
             return {nullptr, false};
     }
 

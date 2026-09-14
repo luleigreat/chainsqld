@@ -135,9 +135,6 @@ HotstuffAdaptor::onExtractTransactions(
 
     notify(protocol::neCLOSING_LEDGER, prevLedger, !wrongLCL);
 
-    // Tell the ledger master not to acquire the ledger we're probably building
-    ledgerMaster_.setBuildingLedger(prevLedger.seq() + 1);
-
     H256Set txs;
     if (!ledgerMaster_.shouldProposeConsensus())
     {
@@ -324,6 +321,24 @@ HotstuffAdaptor::doAccept(typename Ledger_t::ID const& lgrId)
     if (!ledger)
     {
         return false;
+    }
+
+    if (!app_.config().standalone())
+    {
+        if (auto const net = ledgerMaster_.quorumHashForSeq(ledger->seq()))
+        {
+            if (*net != lgrId)
+            {
+                JLOG(j_.warn())
+                    << "Skip Hotstuff switchLCL seq=" << ledger->seq()
+                    << " local=" << lgrId << " network=" << *net;
+                ledgerMaster_.setBuildingLedger(0);
+                ledgerMaster_.discardUnvalidatedClosed(ledger->seq(), lgrId);
+                ledgerMaster_.clearConsensusApplyCaches();
+                ledgerMaster_.requestAcquireForConsensus(*net);
+                return false;
+            }
+        }
     }
 
     ledgerMaster_.updateConsensusTime();
