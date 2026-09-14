@@ -236,6 +236,11 @@ public:
     void
     requestUpdateOpenLedger();
 
+    /** Drop apply caches while replay is still pending, then allow propose.
+        No-ops while buildLCL / openLedger.accept is applying. */
+    void
+    finishConsensusReplay();
+
     boost::optional<NetClock::time_point>
     getCloseTimeBySeq(LedgerIndex ledgerIndex);
     boost::optional<NetClock::time_point>
@@ -443,10 +448,6 @@ private:
 
     void
     clearConsensusWalk();
-
-    /** Drop apply caches while replay is still pending, then allow propose. */
-    void
-    finishConsensusReplay();
 
     void
     touchConsensusWalkPath();
