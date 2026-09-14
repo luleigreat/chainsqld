@@ -560,6 +560,8 @@ private:
     // Publish thread has work to do.
     bool mAdvanceWork{false};
     int mFillInProgress{0};
+    std::uint32_t mSkipHistoryAcquireSeq{0};
+    TimeKeeper::time_point mSkipHistoryAcquireLog{};
 
     int mPathFindThread{0};  // Pathfinder jobs dispatched
     bool mPathFindNewRequest{false};

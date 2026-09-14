@@ -3023,9 +3023,18 @@ LedgerMaster::doAdvance(std::unique_lock<std::recursive_mutex>& sl)
                 if (missing && reason == InboundLedger::Reason::HISTORY &&
                     !anyPeerHasLedgerSeq(app_, *missing))
                 {
-                    JLOG(m_journal.info())
-                        << "Skip history acquire " << *missing
-                        << "; no peer complete_ledgers covers it";
+                    using namespace std::chrono_literals;
+                    auto const now = app_.timeKeeper().now();
+                    if (*missing != mSkipHistoryAcquireSeq ||
+                        mSkipHistoryAcquireLog == TimeKeeper::time_point{} ||
+                        now - mSkipHistoryAcquireLog >= 60s)
+                    {
+                        JLOG(m_journal.debug())
+                            << "Skip history acquire " << *missing
+                            << "; no peer complete_ledgers covers it";
+                        mSkipHistoryAcquireSeq = *missing;
+                        mSkipHistoryAcquireLog = now;
+                    }
                     missing = boost::none;
                 }
                 if (!missing && mFillInProgress == 0)
