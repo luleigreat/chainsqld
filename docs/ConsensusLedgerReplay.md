@@ -213,9 +213,11 @@ getLedgerByHash(hash)
 19. **本地票够了就 `switchLCL` 私有 child（3711）** → `MovedOn` 禁止用本地 `result_` `buildLCL`；该 seq 已有 quorum hash H 则 `Skip buildLCL; use/acquire quorum ledger`，禁止再算一遍。`buildLCL` 之后若 H 已是另一 hash：`Discard local buildLCL`，丢掉 closed 索引，清 apply 缓存，replay H。不要用 `validSeq+3` settle 挡 propose（空链 seq 不涨会一直 abnormal）。空闲空池仍走 `omitEMPTY`。
 20. **`walk wrong-chain` 只停不修** → 错的 3711 写进 SQL，重启仍卡。检测到本机 tip 与网络 parent/hash 不一致时：丢掉该 seq、valid/closed 回到 parent、按网络 hash replay。`tryReplayLedger` 不得用 hash 对不上的 `getLedgerBySeq(seq-1)` 当父本。这是 C/D 漏掉时的后盾，不是唯一防线。
 
-`ContractHelper` 的 dirty/state/SHAMap cache 用一把 `recursive_mutex` 罩住 `flushDirty` / `clearCache` / `setStorage` / `apply`。进入 wrongLedger 和 replay 追上 tip 时 `clearConsensusApplyCaches()`。
-catch-up 结束：`finishConsensusReplay` 先清缓存，再 `mConsensusReplayActive=false`。wrong-chain 回收期间保持 replay pending，禁止 `buildLCL`。
+`ContractHelper` 的 dirty/state/SHAMap cache 用一把 `recursive_mutex` 罩住 `flushDirty` / `clearCache` / `setStorage` / `apply`。进入 wrongLedger 和 replay 追上 tip 时 `requestClearConsensusApplyCaches()`（`jtADVANCE`，`building!=0` 则跳过）。
+catch-up 结束：`finishConsensusReplay` 在 `building==0` 时先清缓存再 `mConsensusReplayActive=false`；`requestAcquire` 若发现 hash 已在本地且正在 `buildLCL`/`openLedger.accept`，不得在共识线程上 `clearCache`。
 `shouldProposeConsensus()` = `!consensusReplayPending()`。`preStartRound` 和 POP `phaseCollecting` 都看它。
+
+21. **追上后第一次 `doAccept` / `openLedger.accept` 与 validation `clearCache` 叠在 `ContractHelper` 上** → `jtCONSENSUS_t` 拿着 `RCLConsensus::mutex_` 等 `clearCache`，heartbeat（limit=1）再等这把锁，LoadManager 90s `Deadlock detected`。共识线程禁止同步 `openLedger.accept` / `InitTableItems` / `clearCache` / `doValid`；`getSHAMap` 禁止持锁 `fetchRoot`。`onConsensusReached` 只 `TryTableSync`（job 内 `InitTableItems`）+ `requestUpdateOpenLedger`。
 
 ---
 
@@ -250,6 +252,7 @@ catch-up 结束：`finishConsensusReplay` 先清缓存，再 `mConsensusReplayAc
 - 追上后：replay 一结束即可 propose；不得再出现 `Propose after catch-up settle until seq=`。空闲空池仍可 `Empty transaction-set from self` 走 omitEMPTY，`server_status` 能进 `normal`。
 - 本机 3711 与网络 tx 数/hash 不同：应出现 `Skip buildLCL; use/acquire quorum ledger` 或 `Discard local buildLCL` / `MovedOn acquire`，不得 `switchLCL` 2 笔那本；SQL 该 seq 不是私有 child。后盾仍是 `drop wrong-chain` + `rewind=` + `replayFromHeaderTx built`。
 - 同一 tx-set 不得再 `LedgerHistory MISMATCH` 且 `account_hash` 不同（4232）：build 期间 `Defer consensus acquire`。
+- 追上后第一次 `buildLCL`：不得再 90s `Deadlock detected`；`server_info` 里 heartbeat 不得长时间 `in_progress` 而 `Checking trusted consensus` 停掉。`openLedger().accept time used` / `doAccept time used` 应打出。
 - 回滚：恢复三处 CONSENSUS acquire，阶段 0–2 行为不变。
 
 ---

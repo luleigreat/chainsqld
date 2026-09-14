@@ -418,7 +418,8 @@ public:
     void
     onModeChange(ConsensusMode before, ConsensusMode after);
 
-    /** Stop proposing and drop apply caches before consensus replay. */
+    /** Stop proposing. Apply-cache clear is queued (not inline on the
+        consensus mutex). */
     void
     onEnterWrongLedger();
 

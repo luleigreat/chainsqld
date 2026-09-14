@@ -352,8 +352,11 @@ Adaptor::onModeChange(ConsensusMode before, ConsensusMode after)
 void
 Adaptor::onEnterWrongLedger()
 {
+    // Check building before clearing it: requestClear no-ops while doAccept
+    // still holds ContractHelper. Zero building after so wrongLedger acquire
+    // is not deferred forever.
+    ledgerMaster_.requestClearConsensusApplyCaches();
     ledgerMaster_.setBuildingLedger(0);
-    ledgerMaster_.clearConsensusApplyCaches();
 }
 
 TrustChanges
@@ -367,29 +370,7 @@ Adaptor::onConsensusReached(bool waitingConsensusReach, Ledger_t previousLedger,
         notify(protocol::neSWITCHED_LEDGER, previousLedger, true);
     }
     if (app_.openLedger().current()->info().seq != previousLedger.seq() + 1)
-    {
-        // Generate new openLedger
-        CanonicalTXSet retriableTxs{beast::zero};
-        auto const lastVal = ledgerMaster_.getValidatedLedger();
-        boost::optional<Rules> rules;
-        if (lastVal)
-            rules.emplace(*lastVal, app_.config().features);
-        else
-            rules.emplace(app_.config().features);
-        app_.openLedger().accept(
-            app_,
-            *rules,
-            previousLedger.ledger_,
-            localTxs_.getTxSet(),
-            false,
-            retriableTxs,
-            tapNONE,
-            "consensus",
-            [&](OpenView& view, beast::Journal j) {
-                // Stuff the ledger with transactions from the queue.
-                return app_.getTxQ().accept(app_, view);
-            });
-    }
+        ledgerMaster_.requestUpdateOpenLedger();
 
     if (!validating())
     {

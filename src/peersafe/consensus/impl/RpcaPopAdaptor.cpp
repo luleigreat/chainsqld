@@ -17,6 +17,7 @@
 */
 //==============================================================================
 
+#include <ripple/core/JobQueue.h>
 #include <ripple/app/ledger/LocalTxs.h>
 #include <ripple/app/ledger/OpenLedger.h>
 #include <ripple/app/ledger/TransactionMaster.h>
@@ -185,7 +186,7 @@ RpcaPopAdaptor::discardLocalIfQuorumDiffers(RCLCxLedger const& built)
                     << " local=" << built.id() << " network=" << *net;
     ledgerMaster_.setBuildingLedger(0);
     ledgerMaster_.discardUnvalidatedClosed(built.seq(), built.id());
-    ledgerMaster_.clearConsensusApplyCaches();
+    ledgerMaster_.requestClearConsensusApplyCaches();
     ledgerMaster_.requestAcquireForConsensus(*net);
     return true;
 }
@@ -383,6 +384,7 @@ RpcaPopAdaptor::consensusBuilt(
 {
     // Because we just built a ledger, we are no longer building one
     ledgerMaster_.setBuildingLedger(0);
+    ledgerMaster_.finishConsensusReplay();
 
     // No need to process validations in standalone mode
     if (app_.config().standalone())
@@ -479,7 +481,12 @@ RpcaPopAdaptor::consensusBuilt(
         auto result = checkLedgerAccept(maxLedger, maxSeq);
         if (result.first && result.second)
         {
-            doValidLedger(result.first);
+            auto ledger = result.first;
+            app_.getJobQueue().addJob(
+                jtACCEPT,
+                "validFromConsensusBuilt",
+                [this, ledger](Job&) { this->doValidLedger(ledger); },
+                app_.doJobCounter());
         }
     }
 }
@@ -569,7 +576,12 @@ RpcaPopAdaptor::handleNewValidation(
 
             if (result.first && result.second)
             {
-                doValidLedger(result.first);
+                auto ledger = result.first;
+                app_.getJobQueue().addJob(
+                    jtACCEPT,
+                    "validFromValidation",
+                    [this, ledger](Job&) { this->doValidLedger(ledger); },
+                    app_.doJobCounter());
             }
             shouldRelay = true;
         }

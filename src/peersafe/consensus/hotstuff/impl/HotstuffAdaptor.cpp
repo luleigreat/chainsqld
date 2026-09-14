@@ -334,7 +334,7 @@ HotstuffAdaptor::doAccept(typename Ledger_t::ID const& lgrId)
                     << " local=" << lgrId << " network=" << *net;
                 ledgerMaster_.setBuildingLedger(0);
                 ledgerMaster_.discardUnvalidatedClosed(ledger->seq(), lgrId);
-                ledgerMaster_.clearConsensusApplyCaches();
+                ledgerMaster_.requestClearConsensusApplyCaches();
                 ledgerMaster_.requestAcquireForConsensus(*net);
                 return false;
             }

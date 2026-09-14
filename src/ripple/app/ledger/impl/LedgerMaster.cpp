@@ -322,8 +322,10 @@ LedgerMaster::onConsensusReached(
     // SHAMap reads; checkLoadLedger only warms FullBelowCache and can pin
     // the disk for hours, during which inbound and consensus starve.
     JLOG(m_journal.info()) << "skip checkLoadLedger; state pages load on demand";
+    // TryTableSync queues jtTABLESYNC (InitTableItems runs there). Do not
+    // CreateTableItems / openLedger.accept here: this is often called while
+    // holding RCLConsensus::mutex_, and heartbeat cannot reset the watchdog.
     app_.getTableSync().TryTableSync();
-    app_.getTableSync().InitTableItems();
     tryAdvance();
 }
 
@@ -913,7 +915,8 @@ LedgerMaster::recoverWrongChainLocal(
     switchLCL(parent);
     mWrongChainDropSeq = forkSeq;
     mConsensusReplayActive.store(true);
-    clearConsensusApplyCaches();
+    if (getBuildingLedger() == 0)
+        clearConsensusApplyCaches();
     rebuildOpenFromValidated();
     return true;
 }
@@ -1060,6 +1063,11 @@ LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
     }
     if (getLedgerByHash(hash))
     {
+        // Consensus thread may hold RCLConsensus::mutex_. Do not wait on
+        // ContractHelper (clearCache) if buildLCL / openLedger.accept is
+        // applying this seq — that is the 90s heartbeat abort.
+        if (getBuildingLedger() != 0)
+            return;
         finishConsensusReplay();
         return;
     }
@@ -1179,10 +1187,51 @@ LedgerMaster::clearConsensusApplyCaches()
 }
 
 void
+LedgerMaster::requestClearConsensusApplyCaches()
+{
+    if (getBuildingLedger() != 0)
+        return;
+    if (mClearApplyCacheJob.exchange(true))
+        return;
+    if (!app_.getJobQueue().addJob(
+            jtADVANCE,
+            "clearApplyCaches",
+            [this](Job&) {
+                if (getBuildingLedger() == 0)
+                    clearConsensusApplyCaches();
+                mClearApplyCacheJob.store(false);
+            },
+            app_.doJobCounter()))
+    {
+        mClearApplyCacheJob.store(false);
+    }
+}
+
+void
+LedgerMaster::requestUpdateOpenLedger()
+{
+    if (mUpdateOpenJob.exchange(true))
+        return;
+    if (!app_.getJobQueue().addJob(
+            jtADVANCE,
+            "updateOpenLedger",
+            [this](Job&) {
+                checkUpdateOpenLedger();
+                mUpdateOpenJob.store(false);
+            },
+            app_.doJobCounter()))
+    {
+        mUpdateOpenJob.store(false);
+    }
+}
+
+void
 LedgerMaster::finishConsensusReplay()
 {
     // Keep pending true until caches are dropped so doAccept still skips
-    // buildLCL. Clearing first avoids wiping a concurrent apply.
+    // buildLCL. Do not clearCache while buildLCL/accept holds ContractHelper.
+    if (getBuildingLedger() != 0)
+        return;
     bool const wasReplay = mConsensusReplayActive.load();
     if (wasReplay)
         clearConsensusApplyCaches();

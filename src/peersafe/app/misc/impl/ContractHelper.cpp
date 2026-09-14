@@ -118,24 +118,35 @@ namespace ripple {
         bool bQuery /*=false*/
     )
     {
-        std::lock_guard lock(mutex_);
-        std::shared_ptr<SHAMap> mapPtr = nullptr;
-        if (mShaMapCache.find(contract) == mShaMapCache.end() || bQuery)
+        // fetchRoot hits NodeStore / inbound. Do not hold mutex_ across it:
+        // jtACCEPT apply and jtCONSENSUS clearCache otherwise deadlock, and
+        // heartbeat (limit=1) then dies at the LoadManager 90s watchdog.
         {
-            mapPtr = std::make_shared<SHAMap>(
-                SHAMapType::CONTRACT, app_.getNodeFamily());
-            if (root && !mapPtr->fetchRoot(SHAMapHash{*root}, nullptr))
-            {
-                JLOG(mJournal.warn()) << "Get storage root failed for contract: "
-                                      << to_string(contract) << ",root hash: "<<*root;
-                return nullptr;
-            }
+            std::lock_guard lock(mutex_);
             if (!bQuery)
-                mShaMapCache[contract] = mapPtr;
+            {
+                auto const it = mShaMapCache.find(contract);
+                if (it != mShaMapCache.end())
+                    return it->second;
+            }
         }
-        else
-            mapPtr = mShaMapCache[contract];
 
+        auto mapPtr = std::make_shared<SHAMap>(
+            SHAMapType::CONTRACT, app_.getNodeFamily());
+        if (root && !mapPtr->fetchRoot(SHAMapHash{*root}, nullptr))
+        {
+            JLOG(mJournal.warn()) << "Get storage root failed for contract: "
+                                  << to_string(contract) << ",root hash: "<<*root;
+            return nullptr;
+        }
+        if (!bQuery)
+        {
+            std::lock_guard lock(mutex_);
+            auto const it = mShaMapCache.find(contract);
+            if (it != mShaMapCache.end())
+                return it->second;
+            mShaMapCache[contract] = mapPtr;
+        }
         return mapPtr;
     }
 

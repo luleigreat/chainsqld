@@ -229,6 +229,13 @@ public:
     void
     clearConsensusApplyCaches();
 
+    /** Queue clearCache / open-ledger rebuild. Never wait on ContractHelper
+        or OpenLedger::modify_mutex_ while holding RCLConsensus::mutex_. */
+    void
+    requestClearConsensusApplyCaches();
+    void
+    requestUpdateOpenLedger();
+
     boost::optional<NetClock::time_point>
     getCloseTimeBySeq(LedgerIndex ledgerIndex);
     boost::optional<NetClock::time_point>
@@ -567,6 +574,8 @@ private:
 
     // One jtADVANCE job for consensus replay chain at a time.
     std::atomic_bool mConsensusAcquireJob{false};
+    std::atomic_bool mClearApplyCacheJob{false};
+    std::atomic_bool mUpdateOpenJob{false};
     // Job hit walk/replay budget; lambda requeues after releasing the flag.
     std::atomic_bool mConsensusWalkYield{false};
 

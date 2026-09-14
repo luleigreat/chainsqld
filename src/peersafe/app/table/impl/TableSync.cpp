@@ -1217,7 +1217,8 @@ void TableSync::TryTableSync()
 {
     ClearNotSyncItem();
 
-    if (!IsNeedSyn())
+    bool const needInit = !IsInitTable();
+    if (!IsNeedSyn() && !needInit)
         return;
 
     if (bTableSyncThread_.exchange(true))
@@ -1229,6 +1230,8 @@ void TableSync::TryTableSync()
 
 void TableSync::TableSyncThread()
 {
+    InitTableItems();
+
     TableSyncItem::BaseInfo stItem;
     std::string PreviousCommit;
     std::list<std::shared_ptr <TableSyncItem>> tmList;
