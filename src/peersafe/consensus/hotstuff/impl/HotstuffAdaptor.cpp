@@ -139,7 +139,13 @@ HotstuffAdaptor::onExtractTransactions(
     ledgerMaster_.setBuildingLedger(prevLedger.seq() + 1);
 
     H256Set txs;
-    if (isPoolAvailable())
+    if (!ledgerMaster_.shouldProposeConsensus())
+    {
+        JLOG(j_.debug())
+            << "onExtractTransactions skip; not ready to propose seq="
+            << prevLedger.seq() + 1;
+    }
+    else if (isPoolAvailable())
     {
         topTransactions(parms_.maxTXS_IN_LEDGER, prevLedger.seq() + 1, txs);
     }

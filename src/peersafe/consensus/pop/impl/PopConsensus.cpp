@@ -702,11 +702,17 @@ PopConsensus::phaseCollecting()
     // Decide if we should propose a tx-set
     if (adaptor_.isLeader(previousLedger_.seq() + 1, view_) && !result_)
     {
-        if (!adaptor_.app_.getLedgerMaster().shouldProposeConsensus())
+        auto& lm = adaptor_.app_.getLedgerMaster();
+        if (!lm.shouldProposeConsensus())
         {
-            JLOG(j_.warn())
-                << "Skip leader propose; consensus replay in progress seq="
-                << previousLedger_.seq() + 1;
+            char const* why = "not ready";
+            if (lm.consensusReplayPending())
+                why = "consensus replay in progress";
+            else if (
+                lm.getValidLedgerIndex() < lm.consensusProposeAfterSeq())
+                why = "settling after catch-up";
+            JLOG(j_.debug()) << "Skip leader propose; " << why
+                             << " seq=" << previousLedger_.seq() + 1;
             return;
         }
 

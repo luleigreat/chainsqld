@@ -209,11 +209,14 @@ public:
     bool
     consensusReplayPending() const;
 
-    /** Propose only when not mid-replay. OperatingMode FULL is not enough. */
+    /** Propose when not mid-replay and past the post-catch-up settle seq. */
     bool
-    shouldProposeConsensus() const
+    shouldProposeConsensus() const;
+
+    LedgerIndex
+    consensusProposeAfterSeq() const
     {
-        return !consensusReplayPending();
+        return mConsensusProposeAfterSeq.load();
     }
 
     /** Drop contract/account apply scratch used by replay and buildLCL. */
@@ -444,6 +447,19 @@ private:
         std::uint32_t curSeq,
         uint256 const& parentHash);
 
+    /** Drop the local wrong tip and rewind valid/closed so network replay can run. */
+    bool
+    recoverWrongChainLocal(
+        uint256 const& cur,
+        std::uint32_t curSeq,
+        uint256 const& parentHash);
+
+    void
+    dropLedgerSeq(std::uint32_t seq);
+
+    void
+    rebuildOpenFromValidated();
+
     void
     joinConsensusWalk(uint256 const& hash);
 
@@ -556,6 +572,8 @@ private:
     std::vector<uint256> mConsensusWalkPath;
     std::uint32_t mConsensusWalkSeq{0};
     std::atomic_bool mConsensusReplayActive{false};
+    std::atomic<LedgerIndex> mConsensusProposeAfterSeq{0};
+    std::uint32_t mWrongChainDropSeq{0};
 
     // Publish thread has work to do.
     bool mAdvanceWork{false};

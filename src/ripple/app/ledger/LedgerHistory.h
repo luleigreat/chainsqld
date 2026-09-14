@@ -115,6 +115,10 @@ public:
     bool
     fixIndex(LedgerIndex ledgerIndex, LedgerHash const& ledgerHash);
 
+    /** Forget seq → hash so a fork at this sequence can be replayed. */
+    void
+    dropIndex(LedgerIndex ledgerIndex);
+
     void
     clearLedgerCachePrior(LedgerIndex seq);
 

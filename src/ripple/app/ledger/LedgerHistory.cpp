@@ -568,6 +568,14 @@ LedgerHistory::fixIndex(LedgerIndex ledgerIndex, LedgerHash const& ledgerHash)
 }
 
 void
+LedgerHistory::dropIndex(LedgerIndex ledgerIndex)
+{
+    std::unique_lock sl(m_ledgers_by_hash.peekMutex());
+    mLedgersByIndex.erase(ledgerIndex);
+    mClosedLedgersByIndex.erase(ledgerIndex);
+}
+
+void
 LedgerHistory::tune(int size, std::chrono::seconds age)
 {
     m_ledgers_by_hash.setTargetSize(size);

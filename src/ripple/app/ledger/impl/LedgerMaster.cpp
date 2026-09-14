@@ -590,7 +590,17 @@ LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
 
     auto parent = getLedgerByHash(headerTx->info().parentHash);
     if (!parent)
+    {
         parent = getLedgerBySeq(seq - 1);
+        if (parent && parent->info().hash != headerTx->info().parentHash)
+        {
+            JLOG(m_journal.warn())
+                << "tryReplayLedger refuse seq-1 parent mismatch seq=" << seq
+                << " local=" << parent->info().hash
+                << " expected=" << headerTx->info().parentHash;
+            parent = {};
+        }
+    }
     if (!parent)
     {
         JLOG(m_journal.debug()) << "tryReplayLedger no parent for " << seq;
@@ -784,6 +794,129 @@ LedgerMaster::consensusWalkWrongChain(
 }
 
 void
+LedgerMaster::dropLedgerSeq(std::uint32_t seq)
+{
+    if (seq <= 1)
+        return;
+    clearLedger(seq);
+    mLedgerHistory.dropIndex(seq);
+    try
+    {
+        auto db = app_.getLedgerDB().checkoutDb();
+        *db << ("DELETE FROM Ledgers WHERE LedgerSeq = " +
+                std::to_string(seq) + ";");
+    }
+    catch (std::exception const& e)
+    {
+        JLOG(m_journal.warn())
+            << "dropLedgerSeq SQL failed seq=" << seq << " : " << e.what();
+    }
+}
+
+void
+LedgerMaster::rebuildOpenFromValidated()
+{
+    auto const lastVal = getValidatedLedger();
+    if (!lastVal)
+        return;
+    auto const closed = getClosedLedger();
+    if (!closed || closed->info().hash != lastVal->info().hash)
+        switchLCL(lastVal);
+    boost::optional<Rules> rules;
+    rules.emplace(*lastVal, app_.config().features);
+    auto retries = CanonicalTXSet({});
+    app_.openLedger().accept(
+        app_,
+        *rules,
+        lastVal,
+        OrderedTxs({}),
+        false,
+        retries,
+        tapNONE,
+        "wrongChainRewind",
+        nullptr);
+}
+
+bool
+LedgerMaster::recoverWrongChainLocal(
+    uint256 const& cur,
+    std::uint32_t curSeq,
+    uint256 const& parentHash)
+{
+    auto const local = localWalkParent();
+    if (!local || curSeq == 0)
+        return false;
+
+    auto const localSeq = local->info().seq;
+    std::uint32_t forkSeq = 0;
+    uint256 rewindHash;
+
+    if (curSeq == localSeq && cur != local->info().hash)
+    {
+        forkSeq = localSeq;
+        rewindHash = parentHash.isNonZero() ? parentHash
+                                            : local->info().parentHash;
+    }
+    else if (curSeq == localSeq + 1 && parentHash != local->info().hash)
+    {
+        forkSeq = localSeq;
+        rewindHash = local->info().parentHash;
+    }
+    else
+    {
+        return false;
+    }
+
+    if (forkSeq <= 1)
+        return false;
+
+    if (mWrongChainDropSeq == forkSeq && getValidLedgerIndex() < forkSeq)
+        return true;
+
+    auto parent = getLedgerByHash(rewindHash);
+    if (!parent)
+        parent = getLedgerBySeq(forkSeq - 1);
+    if (!parent || parent->info().seq != forkSeq - 1)
+    {
+        JLOG(m_journal.warn())
+            << "Need consensus ledger " << cur
+            << " drop wrong-chain failed; no parent for seq=" << forkSeq;
+        return false;
+    }
+    if (rewindHash.isNonZero() && parent->info().hash != rewindHash)
+    {
+        JLOG(m_journal.warn())
+            << "Need consensus ledger " << cur
+            << " drop wrong-chain parent hash mismatch seq=" << parent->info().seq;
+        return false;
+    }
+
+    JLOG(m_journal.warn())
+        << "Need consensus ledger " << cur
+        << " drop wrong-chain local=" << localSeq << " " << local->info().hash
+        << " rewind=" << parent->info().seq << " " << parent->info().hash
+        << " network seq=" << curSeq << " " << cur;
+
+    for (auto s = localSeq; s >= forkSeq; --s)
+        dropLedgerSeq(s);
+
+    {
+        std::lock_guard ml(m_mutex);
+        setValidLedger(parent);
+        if (mLastValidLedger.second >= forkSeq)
+            mLastValidLedger = {parent->info().hash, parent->info().seq};
+        if (mPubLedger && mPubLedger->info().seq >= forkSeq)
+            setPubLedger(parent);
+    }
+    switchLCL(parent);
+    mWrongChainDropSeq = forkSeq;
+    mConsensusReplayActive.store(true);
+    clearConsensusApplyCaches();
+    rebuildOpenFromValidated();
+    return true;
+}
+
+void
 LedgerMaster::joinConsensusWalk(uint256 const& hash)
 {
     if (hash.isZero() || mConsensusWalkPath.empty() ||
@@ -859,11 +992,14 @@ LedgerMaster::joinConsensusWalk(uint256 const& hash)
         auto const parentHash = h->info().parentHash;
         if (consensusWalkWrongChain(cur, curSeq, parentHash))
         {
-            JLOG(m_journal.warn())
-                << "Need consensus ledger " << hash
-                << " join wrong-chain at " << cur << " seq=" << curSeq
-                << " local=" << getValidLedgerIndex();
-            return;
+            if (!recoverWrongChainLocal(cur, curSeq, parentHash))
+            {
+                JLOG(m_journal.warn())
+                    << "Need consensus ledger " << hash
+                    << " join wrong-chain at " << cur << " seq=" << curSeq
+                    << " local=" << getValidLedgerIndex();
+                return;
+            }
         }
         if (getLedgerByHash(parentHash))
         {
@@ -951,6 +1087,16 @@ LedgerMaster::consensusReplayPending() const
     return mConsensusReplayActive.load();
 }
 
+bool
+LedgerMaster::shouldProposeConsensus() const
+{
+    if (consensusReplayPending())
+        return false;
+    if (getValidLedgerIndex() < mConsensusProposeAfterSeq.load())
+        return false;
+    return true;
+}
+
 void
 LedgerMaster::clearConsensusApplyCaches()
 {
@@ -963,9 +1109,22 @@ LedgerMaster::finishConsensusReplay()
 {
     // Keep pending true until caches are dropped so doAccept still skips
     // buildLCL. Clearing first avoids wiping a concurrent apply.
-    if (mConsensusReplayActive.load())
+    bool const wasReplay = mConsensusReplayActive.load();
+    if (wasReplay)
         clearConsensusApplyCaches();
     mConsensusReplayActive.store(false);
+    if (wasReplay)
+    {
+        // Follow a few network ledgers before proposing so gossip can refill
+        // the pool. Prevents packing a 2-tx set while others still have 6.
+        constexpr LedgerIndex kProposeSettleLedgers = 3;
+        auto const seq = getValidLedgerIndex();
+        auto const until = seq + kProposeSettleLedgers;
+        mConsensusProposeAfterSeq.store(until);
+        JLOG(m_journal.warn())
+            << "Propose after catch-up settle until seq=" << until
+            << " valid=" << seq;
+    }
 }
 
 std::shared_ptr<Ledger const>
@@ -1096,6 +1255,8 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
 
         if (consensusWalkWrongChain(cur, curSeq, parentHash))
         {
+            if (recoverWrongChainLocal(cur, curSeq, parentHash))
+                continue;
             JLOG(m_journal.warn())
                 << "Need consensus ledger " << hash
                 << " walk wrong-chain local=" << getValidLedgerIndex()
