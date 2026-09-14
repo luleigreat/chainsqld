@@ -103,6 +103,14 @@ public:
         return mReason;
     }
 
+    /** Header is present and the transaction tree is fully fetched. */
+    bool
+    hasHeaderTx() const
+    {
+        return mHaveHeader && mHaveTransactions && mLedger && !mFailed &&
+            mLedger->info().seq != 0;
+    }
+
     bool
     checkLocal();
     void

@@ -554,10 +554,10 @@ RpcaPopAdaptor::checkLedgerAccept(uint256 const& hash, std::uint32_t seq)
                 app_.peerManager().checkSanity(seq);
         }
 
-        // FIXME: We may not want to fetch a ledger with just one
-        // trusted validation
-        ledger = app_.getInboundLedgers().acquire(
-            hash, seq, InboundLedger::Reason::GENERIC);
+        // Header+tx is enough to resume consensus replay. Do not start a
+        // GENERIC full-tree fetch for a jumped tip; that races REPLAY and
+        // is dropped anyway.
+        ledgerMaster_.requestAcquireForConsensus(hash);
     }
 
     if (ledger)

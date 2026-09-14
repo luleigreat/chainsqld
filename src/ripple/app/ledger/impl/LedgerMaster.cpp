@@ -513,7 +513,7 @@ LedgerMaster::replayFromHeaderTx(
         if (mConsensusReplayMismatch == expectedHash)
             mConsensusReplayMismatch = uint256();
         persistValidated(built);
-        JLOG(m_journal.info())
+        JLOG(m_journal.warn())
             << "replayFromHeaderTx built " << built->info().seq << " "
             << built->info().hash;
         return built;
@@ -546,10 +546,18 @@ LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
     auto inbound = app_.getInboundLedgers().find(hash);
     if (inbound && inbound->getReason() != InboundLedger::Reason::REPLAY)
     {
-        JLOG(m_journal.warn())
-            << "tryReplayLedger drop non-REPLAY inbound " << hash;
-        app_.getInboundLedgers().erase(hash);
-        inbound = {};
+        if (inbound->isComplete() && inbound->getLedger())
+        {
+            storeLedger(inbound->getLedger());
+            return getLedgerByHash(hash);
+        }
+        if (!inbound->hasHeaderTx())
+        {
+            JLOG(m_journal.warn())
+                << "tryReplayLedger drop non-REPLAY inbound " << hash;
+            app_.getInboundLedgers().erase(hash);
+            inbound = {};
+        }
     }
 
     if (!inbound)
@@ -568,7 +576,7 @@ LedgerMaster::tryReplayLedger(uint256 const& hash, std::uint32_t seq)
         return {};
     }
 
-    if (!inbound->isComplete())
+    if (!inbound->hasHeaderTx())
         return {};
 
     auto headerTx = inbound->getLedger();
@@ -671,19 +679,29 @@ void
 LedgerMaster::ensureReplayInbound(uint256 const& hash, std::uint32_t seq)
 {
     auto inbound = app_.getInboundLedgers().find(hash);
-    if (inbound && inbound->getReason() != InboundLedger::Reason::REPLAY)
-    {
-        JLOG(m_journal.warn())
-            << "Need consensus ledger " << hash
-            << " replay (header); drop non-REPLAY inbound";
-        app_.getInboundLedgers().erase(hash);
-        inbound = {};
-    }
     if (inbound && inbound->isFailed())
     {
         JLOG(m_journal.warn())
             << "Need consensus ledger " << hash
             << " replay (header); retry failed inbound seq=" << seq;
+        app_.getInboundLedgers().erase(hash);
+        inbound = {};
+    }
+    if (inbound && inbound->getReason() != InboundLedger::Reason::REPLAY)
+    {
+        if (inbound->isComplete() && inbound->getLedger())
+        {
+            storeLedger(inbound->getLedger());
+            return;
+        }
+        if (inbound->hasHeaderTx())
+        {
+            inbound->touch();
+            return;
+        }
+        JLOG(m_journal.warn())
+            << "Need consensus ledger " << hash
+            << " replay (header); drop non-REPLAY inbound";
         app_.getInboundLedgers().erase(hash);
         inbound = {};
     }
@@ -701,9 +719,7 @@ std::shared_ptr<Ledger const>
 LedgerMaster::replayHeader(uint256 const& hash)
 {
     auto inbound = app_.getInboundLedgers().find(hash);
-    if (!inbound || inbound->getReason() != InboundLedger::Reason::REPLAY)
-        return {};
-    if (inbound->isFailed())
+    if (!inbound || inbound->isFailed())
         return {};
     auto header = inbound->getLedger();
     if (!header || header->info().seq == 0)
@@ -859,10 +875,35 @@ LedgerMaster::joinConsensusWalk(uint256 const& hash)
 }
 
 void
+LedgerMaster::popConsensusWalk(uint256 const& cur, std::uint32_t curSeq)
+{
+    if (mConsensusWalkPath.empty() || mConsensusWalkPath.back() != cur)
+        return;
+    mConsensusWalkPath.pop_back();
+    if (mConsensusWalkPath.empty())
+        mConsensusWalkSeq = 0;
+    else if (auto const child = replayHeader(mConsensusWalkPath.back()))
+        mConsensusWalkSeq = child->info().seq;
+    else
+        mConsensusWalkSeq = curSeq + 1;
+}
+
+uint256
+LedgerMaster::consensusRequestedHash()
+{
+    std::lock_guard lock(mConsensusRequestMutex);
+    return mConsensusRequested;
+}
+
+void
 LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
 {
     if (hash.isZero())
         return;
+    {
+        std::lock_guard lock(mConsensusRequestMutex);
+        mConsensusRequested = hash;
+    }
     if (getLedgerByHash(hash))
         return;
     if (mConsensusAcquireJob.exchange(true))
@@ -870,14 +911,29 @@ LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
     if (!app_.getJobQueue().addJob(
             jtADVANCE,
             "replayConsensusLedger",
-            [this, hash](Job&) {
-                acquireForConsensus(hash);
+            [this](Job&) {
+                auto const h = consensusRequestedHash();
+                acquireForConsensus(h);
+                auto const yield = mConsensusWalkYield.exchange(false);
                 mConsensusAcquireJob.store(false);
+                if (yield)
+                    requestAcquireForConsensus(consensusRequestedHash());
             },
             app_.doJobCounter()))
     {
         mConsensusAcquireJob.store(false);
     }
+}
+
+void
+LedgerMaster::onReplayInboundReady(uint256 const& hash)
+{
+    if (hash.isZero())
+        return;
+    auto req = consensusRequestedHash();
+    if (req.isZero())
+        req = hash;
+    requestAcquireForConsensus(req);
 }
 
 std::shared_ptr<Ledger const>
@@ -935,8 +991,11 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
     // Walk parentHash toward the local tip. Replay the oldest missing
     // ledger whose parent is already local (typically valid+1).
     // kWalkBudget is per job only; total distance is unbounded.
+    // Replay a batch then yield so jtADVANCE can publish (MAX_LEDGER_GAP).
     constexpr int kWalkBudget = 256;
+    constexpr int kReplayYield = 32;
     int walked = 0;
+    int replayed = 0;
     for (; walked < kWalkBudget; ++walked)
     {
         if (auto have = getLedgerByHash(cur))
@@ -945,6 +1004,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
             {
                 clearConsensusWalk();
                 tryAdvance();
+                checkUpdateOpenLedger();
                 return have;
             }
             while (!mConsensusWalkPath.empty() &&
@@ -952,14 +1012,23 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
                 mConsensusWalkPath.pop_back();
             if (mConsensusWalkPath.empty())
             {
-                tryAdvance();
-                return getLedgerByHash(hash);
+                if (auto got = getLedgerByHash(hash))
+                {
+                    clearConsensusWalk();
+                    tryAdvance();
+                    checkUpdateOpenLedger();
+                    return got;
+                }
+                mConsensusWalkPath.push_back(hash);
+                mConsensusWalkTip = hash;
+                mConsensusWalkSeq = seqForConsensusHash(hash);
             }
             cur = mConsensusWalkPath.back();
             curSeq = seqForConsensusHash(cur);
             if (curSeq == 0)
             {
                 ensureReplayInbound(cur, 0);
+                tryAdvance();
                 return {};
             }
             continue;
@@ -981,6 +1050,7 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
             if (cur != mConsensusReplayMismatch)
                 ensureReplayInbound(cur, curSeq);
             mConsensusWalkSeq = curSeq;
+            tryAdvance();
             return {};
         }
         curSeq = header->info().seq;
@@ -1008,27 +1078,44 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
             JLOG(m_journal.warn())
                 << "Need consensus ledger " << hash
                 << " replay chain at " << cur << " seq=" << curSeq;
-            if (tryReplayLedger(cur, curSeq))
+            if (!tryReplayLedger(cur, curSeq))
             {
-                if (!mConsensusWalkPath.empty() &&
-                    mConsensusWalkPath.back() == cur)
-                {
-                    mConsensusWalkPath.pop_back();
-                    if (mConsensusWalkPath.empty())
-                        mConsensusWalkSeq = 0;
-                    else if (
-                        auto const child =
-                            replayHeader(mConsensusWalkPath.back()))
-                        mConsensusWalkSeq = child->info().seq;
-                    else
-                        mConsensusWalkSeq = curSeq + 1;
-                }
                 touchConsensusWalkPath();
                 tryAdvance();
                 return getLedgerByHash(hash);
             }
+            popConsensusWalk(cur, curSeq);
+            ++replayed;
             touchConsensusWalkPath();
-            return getLedgerByHash(hash);
+            tryAdvance();
+            if (auto have = getLedgerByHash(hash))
+            {
+                clearConsensusWalk();
+                checkUpdateOpenLedger();
+                return have;
+            }
+            if (replayed >= kReplayYield)
+            {
+                mConsensusWalkYield.store(true);
+                checkUpdateOpenLedger();
+                return getLedgerByHash(hash);
+            }
+            if (mConsensusWalkPath.empty())
+            {
+                mConsensusWalkPath.push_back(hash);
+                mConsensusWalkTip = hash;
+                mConsensusWalkSeq = seqForConsensusHash(hash);
+            }
+            cur = mConsensusWalkPath.back();
+            curSeq = mConsensusWalkSeq;
+            if (curSeq == 0)
+                curSeq = seqForConsensusHash(cur);
+            if (curSeq == 0)
+            {
+                ensureReplayInbound(cur, 0);
+                return {};
+            }
+            continue;
         }
 
         cur = parentHash;
@@ -1044,9 +1131,11 @@ LedgerMaster::acquireForConsensus(uint256 const& hash)
     JLOG(m_journal.warn())
         << "Need consensus ledger " << hash
         << " walk budget local=" << getValidLedgerIndex()
-        << " network=" << netSeq << " walked=" << walked;
+        << " network=" << netSeq << " walked=" << walked
+        << " replayed=" << replayed;
     touchConsensusWalkPath();
     tryAdvance();
+    mConsensusWalkYield.store(true);
     return getLedgerByHash(hash);
 }
 
@@ -2014,6 +2103,14 @@ LedgerMaster::checkUpdateOpenLedger()
                                << app_.openLedger().current()->seq()
                                << "<= mValidLedgerSeq:" << mValidLedgerSeq;
         auto const lastVal = getValidatedLedger();
+        // beginConsensus asserts open.parentHash == closed.hash. Move both
+        // together: closed = valid, then rebuild open as valid+1.
+        if (lastVal)
+        {
+            auto const closed = getClosedLedger();
+            if (!closed || closed->info().hash != lastVal->info().hash)
+                switchLCL(lastVal);
+        }
         boost::optional<Rules> rules;
         if (lastVal)
             rules.emplace(*lastVal, app_.config().features);
@@ -2173,11 +2270,11 @@ LedgerMaster::findNewLedgersToPublish(
             if (!ledger && (++acqCount < ledger_fetch_size_))
             {
                 auto inbound = app_.getInboundLedgers().find(*hash);
-                bool const replayPending =
+                bool const replayFetching =
                     inbound &&
                     inbound->getReason() == InboundLedger::Reason::REPLAY &&
                     !inbound->isFailed();
-                if (!replayPending && *hash != mConsensusReplayMismatch)
+                if (!replayFetching && *hash != mConsensusReplayMismatch)
                     ledger = app_.getInboundLedgers().acquire(
                         *hash, seq, InboundLedger::Reason::GENERIC);
             }

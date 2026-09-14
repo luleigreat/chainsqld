@@ -605,6 +605,11 @@ InboundLedger::done()
                         self->app().getLedgerMaster().checkUpdateOpenLedger();
                     }
                 }
+                else
+                {
+                    self->app().getLedgerMaster().onReplayInboundReady(
+                        self->mHash);
+                }
                 self->app().getLedgerMaster().tryAdvance();
             }
             else

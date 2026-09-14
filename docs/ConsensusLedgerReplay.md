@@ -53,9 +53,10 @@ publish 路径是 `pub+1 … valid` 顺序重放，不会对 tip 开整树。共
 
 | 位置 | 行为 |
 |---|---|
-| `Adaptor::acquireLedger` | 共识 startRound / timer / 多数 peer 指向另一本 prevLedger |
-| `NetworkOPs` 切网 LCL | `acquire(closedLedger, 0, CONSENSUS)` 后 `switchLastClosedLedger` |
-| `RCLValidationsAdaptor::acquire` | preferred LCL 分析，同样 `getConsensusLedger` + CONSENSUS |
+| `Adaptor::acquireLedger` | `requestAcquireForConsensus` |
+| `NetworkOPs` 切网 LCL | 同上 |
+| `RCLValidationsAdaptor::acquire` | 同上 |
+| `RpcaPopAdaptor::checkLedgerAccept` | **禁止** GENERIC 整树；同样 `requestAcquireForConsensus` |
 
 只改 Adaptor，另外两处仍会打满磁盘。
 
@@ -96,20 +97,23 @@ getLedgerByHash(hash)
 
 从目标 hash 沿 header.parentHash 往回走。总距离不封顶（须能走过 527 / 1000）：
   记住整条 path（tip → 最老）。下一轮从最老继续，不从 tip 重扫
-  每轮最多 256 步（本 job 预算）；撞预算一条 WRN：`walk budget local=… network=… walked=256`
+  每轮最多 256 步（本 job 预算）；撞预算一条 WRN：`walk budget local=… network=… walked=256 replayed=…`
+  撞预算 / 一批重放满 32 本 → job 结束并 **自己再挂 jtADVANCE**，让 publish 有机会跑（避免 MAX_LEDGER_GAP 跳号）
   已缓存 header 不再每步打 `Skip … walk parent`
-  每轮 touch path 上未失败的 REPLAY inbound，避免 1 分钟 sweep
+  每轮 touch path 上未失败的 inbound，避免 1 分钟 sweep
   failed inbound 要 erase 再 acquire，不能 touch 续命
-  重放成功只 pop 最老一本，下一本用 path 里的 child，不再从 tip 重走
-  重放成功或已拿到 tip 时 tryAdvance，published 跟 +1，避免 MAX_LEDGER_GAP 跳号
+  重放成功只 pop 最老一本，**同一 job 继续下一本**（不再每本 return 等 15s timer）
+  `REPLAY` inbound 完成（header+tx）→ `onReplayInboundReady` 立刻续跑，不要干等共识 timer
   新 tip 先接到已有 path（parent 已在 path / 短距离 join）；接不上仍继续最老一本
   `curSeq < local` 或同高 hash 不同或 `valid+1` 的 parent ≠ 本地 → `walk wrong-chain` 停
   当前本已在本地 → 若是目标则返回；否则 pop 已齐后缀，从 path 下一本继续
-  无 header → REPLAY 当前 hash（只要头+tx），记住 walk 位置，返回 none
+  无 header → REPLAY 当前 hash（只要头+tx），记住 walk 位置，返回 none（等 inbound 完成回调）
   parentHash 已在本地 → tryReplayLedger(当前)（通常是 valid+1）
-                         一次 job 只重放一本，下轮再往前
+  已 complete 的 GENERIC 整本：storeLedger 使用，**不要 erase**
+  未拿到 header+tx 的 GENERIC/CONSENSUS：erase 改 REPLAY
   重放 apply 与共识对齐：retry pass + LedgerAdjust::updateTxCount
   同一 hash root mismatch 只打一次，不再 erase 拉头重试
+  重放成功只 `persistValidated`（valid）。closed/open 一起动：`checkUpdateOpenLedger` 里先 `switchLCL(valid)` 再重建 open=valid+1，保证 `open.parentHash == closed.hash`
   parent 不在 → 当前 = parentHash，push 进 path，继续走
 
 共识线程只 getLedgerByHash + requestAcquireForConsensus（jtADVANCE）。
@@ -141,7 +145,7 @@ getLedgerByHash(hash)
 
 - `acquireLedger` 只允许 `getLedgerByHash` + `requestAcquireForConsensus`（`jtADVANCE` / `replayConsensusLedger`）。
 - `replayFromHeaderTx` / `persistValidated` 只在该 job 里跑，共识线程不 `buildLedger`。
-- `requestAcquireForConsensus` 同时只挂一个 job；跑完再由下一轮 timer 继续往前重放。
+- `requestAcquireForConsensus` 同时只挂一个 job；job 内连续重放最多 32 本后 yield 再挂；等 inbound 时由 `onReplayInboundReady` 续跑。
 - 同一 hash 的 `acquiringLedger_` 只用于去重日志。
 - 重放成功后 `inboundTransactions_.newRound(seq)` 保持现有 `acquireLedger` 成功分支。
 
@@ -164,12 +168,14 @@ getLedgerByHash(hash)
 2. `Adaptor::acquireLedger` 改为调它；去掉直接 `Reason::CONSENSUS`。
 3. `NetworkOPs` 切网 LCL 同样改调它；切过去之前仍要 `canBeCurrent` / `isCompatible`（用重放出来的完整 built，不是 REPLAY 半成品）。
 4. `RCLValidationsAdaptor::acquire` 同样改调它。分析 preferred LCL 不需要合约树齐，有 built 即可。
-5. 日志（info/warn，便于对照现网）：
+5. `RpcaPopAdaptor::checkLedgerAccept` 不得 `acquire(GENERIC)`。
+6. 日志（info/warn，便于对照现网）：
    - `Need consensus ledger` 保留，后面跟 `replay` / `wait-parent` / `cold-inbound`
    - 重放成功复用 `replayFromHeaderTx built`
    - 跳过整本：`Skip consensus inbound <hash> seq=…; no parent, wait sequential replay`
-   - 本轮步数用尽：`Need consensus ledger <hash> walk budget local=… network=… walked=256`
+   - 本轮步数用尽：`Need consensus ledger <hash> walk budget local=… network=… walked=256 replayed=…`
    - 错链刹车：`Need consensus ledger <hash> walk wrong-chain local=… at <cur> seq=…`
+   - 重放成功（WRN）：`replayFromHeaderTx built <seq> <hash>`
 
 不改：`buildLedger`、`TxSet`、`published` / TableSync、`tryFill`、LedgerCleaner、HISTORY 的 peer 范围跳过。
 
@@ -197,6 +203,9 @@ getLedgerByHash(hash)
 10. **watching 空 `valPublic` 回归** → 重放路径不要碰 ProposeSet / `gotTxSet` 的公钥复用。
 11. **`complete_ledgers` 出现洞还对外说连续** → RangeSet 如实；顺序补洞，不 `tryFill` 假连续。
 12. **缺一页就 acquire tip** → 与 `checkLoadLedger` 同类。只拉 miss 的 node hash。
+13. **每个 job 只重放一本就 return，且 REPLAY 完成不续跑** → 追上 tip 附近后只拉新 tip header，最后几本永远不重放。必须 job 内连续重放 + inbound 完成回调 + 预算自挂。
+14. **只推 valid、不切 closed，或只切 closed 不改 open** → `beginConsensus` 假定 `open.parentHash == closed.hash`。必须在 `checkUpdateOpenLedger` 里两者一起动：先 `switchLCL(valid)`，再重建 open。
+15. **`RpcaPopAdaptor::checkLedgerAccept` 对 tip 开 GENERIC** → 每个新 tip `drop non-REPLAY`，和重放抢 inbound。改走 `requestAcquireForConsensus`。
 
 ---
 

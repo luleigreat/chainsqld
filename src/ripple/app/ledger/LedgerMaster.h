@@ -187,9 +187,10 @@ public:
         Prefers a local copy, then header+tx replay. If the parent of the
         target is missing, walks parentHash toward the local tip and replays
         the oldest missing ledger (valid+1, then +2, ...). Remembers the
-        hash path so the next job continues from the oldest position and
-        the next child after a successful replay. Stops if the walk passes
-        the local executable ledger with a different hash. Never starts
+        hash path so the next job continues from the oldest position.
+        One job replays a batch (then yields so publish can run) instead of
+        returning after a single ledger. Stops if the walk passes the local
+        executable ledger with a different hash. Never starts
         Reason::CONSENSUS / GENERIC inbound for a jumped tip.
     */
     std::shared_ptr<Ledger const>
@@ -198,6 +199,10 @@ public:
     /** Run acquireForConsensus on jtADVANCE. Safe from the consensus thread. */
     void
     requestAcquireForConsensus(uint256 const& hash);
+
+    /** REPLAY (or header+tx) inbound finished; resume the consensus walk. */
+    void
+    onReplayInboundReady(uint256 const& hash);
 
     boost::optional<NetClock::time_point>
     getCloseTimeBySeq(LedgerIndex ledgerIndex);
@@ -422,6 +427,12 @@ private:
     void
     joinConsensusWalk(uint256 const& hash);
 
+    void
+    popConsensusWalk(uint256 const& cur, std::uint32_t curSeq);
+
+    uint256
+    consensusRequestedHash();
+
     std::shared_ptr<Ledger const>
     replayFromHeaderTx(
         std::shared_ptr<Ledger const> const& parent,
@@ -514,6 +525,11 @@ private:
 
     // One jtADVANCE job for consensus replay chain at a time.
     std::atomic_bool mConsensusAcquireJob{false};
+    // Job hit walk/replay budget; lambda requeues after releasing the flag.
+    std::atomic_bool mConsensusWalkYield{false};
+
+    std::mutex mConsensusRequestMutex;
+    uint256 mConsensusRequested;
 
     // parentHash path: network tip first, oldest missing last.
     uint256 mConsensusWalkTip;
