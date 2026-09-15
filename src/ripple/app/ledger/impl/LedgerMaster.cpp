@@ -655,6 +655,8 @@ LedgerMaster::seqForConsensusHash(uint256 const& hash)
             return pub->info().seq - 1;
     }
 
+    // Must not run while Validations::mutex_ is held: getTrustedForLedger
+    // and currentTrusted lock that same non-recursive mutex.
     {
         auto const trusted = app_.getValidations().getTrustedForLedger(hash);
         if (!trusted.empty() && trusted.front() &&
@@ -1071,6 +1073,18 @@ LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
         finishConsensusReplay();
         return;
     }
+    scheduleAcquireForConsensus(hash);
+}
+
+void
+LedgerMaster::scheduleAcquireForConsensus(uint256 const& hash)
+{
+    if (hash.isZero())
+        return;
+    {
+        std::lock_guard lock(mConsensusRequestMutex);
+        mConsensusRequested = hash;
+    }
     mConsensusReplayActive.store(true);
     if (mConsensusAcquireJob.exchange(true))
         return;
@@ -1079,7 +1093,19 @@ LedgerMaster::requestAcquireForConsensus(uint256 const& hash)
             "replayConsensusLedger",
             [this](Job&) {
                 auto const h = consensusRequestedHash();
-                acquireForConsensus(h);
+                if (!h.isZero())
+                {
+                    auto const seq = seqForConsensusHash(h);
+                    if (shouldAcquireForConsensus(h, seq))
+                        acquireForConsensus(h);
+                    else
+                    {
+                        JLOG(m_journal.debug())
+                            << "Defer consensus acquire " << h
+                            << " seq=" << seq
+                            << " building=" << getBuildingLedger();
+                    }
+                }
                 auto const yield = mConsensusWalkYield.exchange(false);
                 mConsensusAcquireJob.store(false);
                 if (yield)

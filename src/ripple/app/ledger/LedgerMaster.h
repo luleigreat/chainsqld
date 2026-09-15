@@ -197,9 +197,16 @@ public:
     std::shared_ptr<Ledger const>
     acquireForConsensus(uint256 const& hash);
 
-    /** Run acquireForConsensus on jtADVANCE. Safe from the consensus thread. */
+    /** Run acquireForConsensus on jtADVANCE. Safe from the consensus thread.
+        Must not be called while holding Validations::mutex_: seq lookup
+        re-locks that non-recursive mutex. */
     void
     requestAcquireForConsensus(uint256 const& hash);
+
+    /** Record a missing consensus hash and queue jtADVANCE. Safe while
+        Validations::mutex_ is held (no Validations / SQL / clearCache). */
+    void
+    scheduleAcquireForConsensus(uint256 const& hash);
 
     /** REPLAY (or header+tx) inbound finished; resume the consensus walk. */
     void
